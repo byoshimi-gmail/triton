@@ -216,10 +216,11 @@ module {
         tl.store(dst + offsets, x, mask=offsets < N)
 
     grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
-    _kernel[grid](dst, src, N=N)
+    kernel_obj = _kernel[grid](dst, src, N=N)
 
     # Change the behavior of kernel by overriding PTX
     torch.testing.assert_close(src * 10, dst)
+    assert "arith.mulf" in kernel_obj.asm["ttir"]
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
@@ -266,10 +267,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
         tl.store(dst + offsets, x, mask=offsets < N)
 
     grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
-    _kernel[grid](dst, src, N=N)
+    kernel_obj = _kernel[grid](dst, src, N=N)
 
     # Change the behavior of kernel by overriding PTX
     torch.testing.assert_close(src * 10, dst)
+    assert "arith.mulf" in kernel_obj.asm["ttgir"]
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
@@ -364,10 +366,11 @@ $L__func_end0:
         tl.store(dst + offsets, x, mask=offsets < N)
 
     grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
-    _kernel[grid](dst, src, N=N)
+    kernel_obj = _kernel[grid](dst, src, N=N)
 
     # Change the behavior of kernel by overriding PTX
     torch.testing.assert_close(src * 10, dst)
+    assert "mul.f32" in kernel_obj.asm["ptx"]
 
 
 def test_exceed_tmem(device):
