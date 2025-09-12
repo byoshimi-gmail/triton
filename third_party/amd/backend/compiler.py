@@ -94,6 +94,7 @@ class HIPOptions:
 
 class HIPBackend(BaseBackend):
     instrumentation = None
+    supports_native_tensor_specialization = False
 
     @staticmethod
     def supports_target(target: GPUTarget):
@@ -109,6 +110,9 @@ class HIPBackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         args = {'arch': knobs.runtime.override_arch or self.target.arch}
+
+        if opts.get("num_ctas", 1) > 1:
+            raise ValueError("num_ctas > 1 not supported for AMD GPUs")
 
         # Enable XF32 (TF32) for CDNA3 GPUs
         if self.target.arch == 'gfx942':
@@ -172,11 +176,9 @@ class HIPBackend(BaseBackend):
         return ret
 
     @staticmethod
-    def get_arg_specialization(arg, ty, **kwargs):
-        ret = BaseBackend.get_arg_specialization(arg, ty, **kwargs)
-        # Only attempt to do buffer ops specialization if buffer ops are enabled.
-        # Otherwise the is_within_2gb check is unnecessary overhead.
-        if knobs.amd.use_buffer_ops and ty == "tensor" and HIPBackend.is_within_2gb(arg):
+    def get_tensor_specialization(arg, **kwargs):
+        ret = BaseBackend.get_tensor_specialization(arg, **kwargs)
+        if knobs.amd.use_buffer_ops and HIPBackend.is_within_2gb(arg):
             ret += "S"
         return ret
 
@@ -194,7 +196,7 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod)
+        pm.run(mod, 'make_ttir')
         return mod
 
     @staticmethod
@@ -203,7 +205,7 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
                                            options.num_ctas)
-        pm.run(mod)
+        pm.run(mod, 'make_ttgir_early')
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.ttgpuir.add_coalesce(pm)
@@ -212,7 +214,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
-        passes.ttgpuir.add_optimize_dot_operands(pm, True)
+        amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
         amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
 
         passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -232,7 +234,6 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             amd.passes.ttgpuir.insert_instruction_sched_hints(pm, options.schedule_hint)
-        passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
@@ -253,7 +254,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         if use_async_copy:
             amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
-        pm.run(mod)
+        pm.run(mod, 'make_ttgir')
         return mod
 
     @staticmethod
@@ -269,7 +270,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
-        pm.run(mod)
+        pm.run(mod, 'gluon_to_ttgir')
         return mod
 
     @staticmethod
@@ -285,7 +286,8 @@ class HIPBackend(BaseBackend):
         # LDS size is determined by provided arch name.
         custom_lds_size = 0
         amd.passes.ttgpuir.add_optimize_lds_usage(pm, options.arch, custom_lds_size)
-        passes.convert.add_triton_scf_to_cf(pm)
+        passes.convert.add_scf_to_cf(pm)
+        passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
 
         amd.passes.ttgpuir.add_allocate_shared_memory(pm)
@@ -321,7 +323,7 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
-        pm.run(mod)
+        pm.run(mod, 'make_llir')
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
@@ -350,11 +352,13 @@ class HIPBackend(BaseBackend):
         # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
         # This attribute may be attached to a kernel function definition and is an optimization hint.
         # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
-        # specifies the requested maximum number of waves per EU (must be greater than <min> if specified).
+        # specifies the requested maximum number of waves per EU (must be >= <min> if specified).
         # If <max> is omitted, then there is no restriction on the maximum number of waves per EU other than
         # the one dictated by the hardware for which the kernel is compiled. Passing 0, 0 as <min>, <max>
         # implies the default behavior (no limits).
-        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}")
+        # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
+        # and may improve scheduling.
+        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
@@ -376,7 +380,8 @@ class HIPBackend(BaseBackend):
             llvm.link_extern_libs(llvm_mod, paths)
         elif options.extern_libs:
             paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
-            llvm.link_extern_libs(llvm_mod, paths)
+            if len(paths) > 0:
+                llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 
@@ -419,7 +424,9 @@ class HIPBackend(BaseBackend):
         # the regression is not significant. It would be better to have some heuristics.
         if options.schedule_hint == 'attention':
             flags.append('sink-insts-to-avoid-spills')
-        amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, '', flags, options.enable_fp_fusion, False)
+        features = '-real-true16' if 'gfx11' in options.arch else ''
+        amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
+                                       False)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)

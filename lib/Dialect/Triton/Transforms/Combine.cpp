@@ -123,7 +123,7 @@ public:
       : RewritePattern(ReduceOp::getOperationName(), 1, context) {}
 
   LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const {
+                                PatternRewriter &rewriter) const override {
     auto reduceOp = llvm::dyn_cast<ReduceOp>(op);
     if (!reduceOp)
       return failure();
@@ -252,6 +252,11 @@ public:
     }
     if (!isZero(dotOp.getC()))
       return failure();
+    if constexpr (std::is_same_v<OpTy, arith::AddFOp>) {
+      if (dotOp.getMaxNumImpreciseAcc() != 0) {
+        return failure();
+      }
+    }
     rewriter.modifyOpInPlace(dotOp, [&] {
       dotOp.getCMutable().assign(isDotLHS ? addOp.getRhs() : addOp.getLhs());
       dotOp->moveBefore(addOp);

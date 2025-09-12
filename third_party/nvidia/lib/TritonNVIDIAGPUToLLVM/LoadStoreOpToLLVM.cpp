@@ -661,7 +661,7 @@ struct AtomicCASOpConversion
         // Only threads with mask = True store the result
         PTXBuilder ptxBuilderStore;
         auto *dstOprStore = ptxBuilderStore.newAddrOperand(atomPtr, "r");
-        auto *valOprStore = ptxBuilderStore.newOperand(old, "r");
+        auto *valOprStore = ptxBuilderStore.newOperand(old, tyId);
         auto &st = *ptxBuilderStore.create<PTXInstr>("st");
         st.shared().o(sTy);
         st(dstOprStore, valOprStore).maybePredicate(threadPred);
@@ -903,7 +903,7 @@ public:
         Value atom = rewriter
                          .create<LLVM::AtomicRMWOp>(
                              loc, *llvmAtomicBinOp, rmwPtr, valElements[i],
-                             *llvmAtomicMemOrdering, StringRef("agent"))
+                             *llvmAtomicMemOrdering, StringRef("device"))
                          .getResult();
         // Handle the 2 bf16 case
         if (packed == 2 && valueElemNBits == 16) {
@@ -911,7 +911,7 @@ public:
                             .create<LLVM::AtomicRMWOp>(
                                 loc, *llvmAtomicBinOp, ptrElements[i + 1],
                                 valElements[i + 1], *llvmAtomicMemOrdering,
-                                StringRef("agent"))
+                                StringRef("device"))
                             .getResult();
           auto vecTy = vec_ty(valueElemTy, vec);
           auto tmp =
@@ -1250,10 +1250,11 @@ struct AsyncCopyGlobalToLocalOpConversion
         {str_attr("offset")});
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
     auto maskSpanAffineOffset = SharedMemoryObject::getMaskSpanOffsets(dstTy);
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     lowerLdSt(
         loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
-        [](Value v) { return v; }, affineOffset, maskSpanAffineOffset, rewriter,
-        targetInfo, maxVec, emitCpAsync);
+        [](Value v) { return v; }, affineOffset, maskSpanAffineOffset, laneId,
+        warpId, rewriter, targetInfo, maxVec, emitCpAsync);
 
     // Drop the result token.
     Value zero = rewriter.create<LLVM::ConstantOp>(
@@ -1322,14 +1323,15 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    Type llvmElemTy =
-        typeConverter->convertType(op.getResult().getType().getElementType());
+    ttg::MemDescType dstTy = op.getResult().getType();
+    Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getBarrier(),
         typeConverter->convertType(op.getBarrier().getType().getElementType()),
         rewriter);
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), llvmElemTy, rewriter);
+    Value dstBase = dstMemObj.getShmemAffineBase(loc, rewriter, dstTy);
     auto voidTy = void_ty(op->getContext());
     auto id = getThreadId(rewriter, loc);
 
@@ -1382,8 +1384,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           applyLinearLayout(loc, rewriter, msgToShared,
                             {{kMsg, copyIdxVal}, {kBlock, zero}})[0]
               .second;
-      Value shMemPtr =
-          b.gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(), shMemOffset);
+      Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
       SmallVector<PTXBuilder::Operand *> operands = {
           ptxBuilderTMA.newOperand(boxPred, "b"),
           ptxBuilderTMA.newOperand(shMemPtr, "r"),
@@ -1428,6 +1429,7 @@ LogicalResult convertTMAStoreLikeOp(Operation *op,
   Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
   auto dstMemObj =
       LLVM::getSharedMemoryObjectFromStruct(loc, src, llvmElemTy, rewriter);
+  Value dstBase = dstMemObj.getShmemAffineBase(loc, rewriter, srcTy);
   auto voidTy = void_ty(op->getContext());
   auto id = getThreadId(rewriter, loc);
   // Select just one thread for the TMA copy. This also helps the compiler to
@@ -1470,8 +1472,7 @@ LogicalResult convertTMAStoreLikeOp(Operation *op,
         applyLinearLayout(loc, rewriter, msgToShared,
                           {{kMsg, copyIdxVal}, {kBlock, zero}})[0]
             .second;
-    Value shMemPtr =
-        b.gep(elemPtrTy, llvmElemTy, dstMemObj.getBase(), shMemOffset);
+    Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
     SmallVector<PTXBuilder::Operand *> operands = {
         ptxBuilderTMA.newOperand(boxPred, "b"),
         ptxBuilderTMA.newOperand(tmaPtr, "l")};
@@ -1613,6 +1614,7 @@ static LogicalResult iterateGatherScatterIndices(
   Type elemPtrTy = ptr_ty(ctx, /*addrspace=*/3);
   auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, smemObjValue,
                                                        llvmElemTy, rewriter);
+  Value smemBase = smemObj.getShmemAffineBase(loc, rewriter, smemType);
 
   unsigned threadsPerWarp = xCoordsLayout.getInDimSize(kLane);
   unsigned numWarps = xCoordsLayout.getInDimSize(kWarp);
@@ -1680,8 +1682,7 @@ static LogicalResult iterateGatherScatterIndices(
       Value shMemOffset = result.front().second;
       // Because we checked that the memdesc's allocshape and shape match, we
       // can ignore the strides and directly index into the shmem object.
-      Value shMemPtr =
-          b.gep(elemPtrTy, llvmElemTy, smemObj.getBase(), shMemOffset);
+      Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, smemBase, shMemOffset);
       Value yOffset = b.add(yOffsetValue, b.i32_val(msgId * msgSize));
 
       callback(pred, shMemPtr, yOffset, ArrayRef(xOffsets).slice(regId, 4));

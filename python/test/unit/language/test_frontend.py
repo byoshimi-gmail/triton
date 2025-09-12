@@ -308,7 +308,35 @@ def test_aggregate_with_constexpr():
     # CHECK: arith.addi %arg0, %cst : tensor<4xi32>
 
 
-@tl.constexpr_function
+@tl.core._aggregate
+class AggregateWithTuple:
+    a: tl.tuple
+
+    def __init__(self, a):
+        self.a = tl.tuple((a, ))
+
+    @staticmethod
+    @triton.jit
+    def create(a):
+        return AggregateWithTuple(a)
+
+
+@triton.jit
+def pass_tuple_aggregate(agg):
+    pass
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_with_tuple():
+    # CHECK-LABEL: test_aggregate_with_tuple
+    # CHECK: tt.call @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
+    agg = AggregateWithTuple.create(tl.arange(0, 4))
+    pass_tuple_aggregate(agg)
+    # CHECK: tt.func private @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
+
+
+@triton.constexpr_function
 def constexpr_function(x):
     return x + 1
 
@@ -345,12 +373,12 @@ def test_reassign_aggregate_with_constexpr():
     agg = agg.modify(tl.arange(4, 8))
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def make_shape(m, n):
     return (m, n)
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def add_shape_dims(m, n):
     return m + n
 
@@ -365,7 +393,7 @@ def test_constexpr_getitem():
     tl.arange(4, sum)
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def make_constexpr_closure(x):
     x = tl.constexpr(x)
 
@@ -386,7 +414,7 @@ def test_constexpr_closure():
     closure((128, 128))
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def make_constexpr_generator(f):
     f = tl.constexpr(f)
 
@@ -422,7 +450,7 @@ def test_constexpr_generator():
     generator(lhs)
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def Box(T):
 
     @tl.core._aggregate
@@ -507,7 +535,7 @@ def test_return_in_while():
             i += 1
 
     with pytest.raises(CompilationError) as e:
-        kernel.warmup(grid=(1, ))
+        run_parser(kernel)
 
     assert "Cannot have `return` statements inside `while` or `for` statements in triton" in str(e.value)
 
@@ -531,4 +559,32 @@ def foo(test: TestTuple):
 
 def test_tuple_constexpr():
     test = TestTuple(test=TensorPtr(tl.constexpr(1)))
-    _ = foo.warmup(test, grid=(1, 0))
+    run_parser(foo, args=(test, ))
+
+
+@tl.core._aggregate
+class AggregateWithConstexprFunction:
+    val: tl.constexpr
+    val_squared: tl.constexpr
+
+    def __init__(self, val):
+        self.val = tl.constexpr(val)
+        self.val_squared = tl.constexpr(self.square_val())
+
+    @triton.constexpr_function
+    def square_val(self):
+        return self.val * self.val
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_constexpr_function():
+    agg = AggregateWithConstexprFunction(4)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_4_
+    anchor(agg.val)
+
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
+    anchor(agg.val_squared)
+
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
+    anchor(agg.square_val())

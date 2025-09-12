@@ -1,4 +1,5 @@
 import ast
+import builtins
 import contextlib
 import copy
 import inspect
@@ -14,9 +15,8 @@ from .. import knobs, language
 from .._C.libtriton import ir, gluon_ir
 from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
 from ..language.core import _unwrap_if_constexpr, base_value, base_type
-from ..runtime.jit import get_jit_fn_file_line, get_full_name
 # ideally we wouldn't need any runtime component
-from ..runtime import JITFunction
+from ..runtime.jit import get_jit_fn_file_line, get_full_name, JITCallable, BoundConstexprFunction, ConstexprFunction, JITFunction
 from .._utils import find_paths_if, get_iterable_path, set_iterable_path
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
@@ -52,7 +52,7 @@ def _is_triton_tensor(o: Any) -> bool:
 
 
 def _is_constexpr(o: Any) -> bool:
-    return o is None or isinstance(o, (constexpr, language.core.dtype, JITFunction))
+    return o is None or isinstance(o, (constexpr, language.core.dtype, JITCallable))
 
 
 def _is_non_scalar_tensor(o: Any) -> bool:
@@ -396,7 +396,7 @@ class CodeGenerator(ast.NodeVisitor):
                     val is absent,
                     name in self.builtin_namespace,  #
                     type(val) is ModuleType,  #
-                    isinstance(val, JITFunction),  #
+                    isinstance(val, JITCallable),  #
                     getattr(val, "__triton_builtin__", False),  #
                     getattr(val, "__triton_aggregate__", False),  #
                     getattr(val, "__module__", "").startswith("triton.language"),  #
@@ -1039,7 +1039,8 @@ class CodeGenerator(ast.NodeVisitor):
     def _verify_loop_carried_variable(self, name, loop_val, live_val):
         assert _is_triton_value(loop_val), f'cannot reassign constexpr {name} in the loop'
         assert _is_triton_value(live_val), f'cannot reassign constexpr {name} in the loop'
-        assert type(loop_val) is type(live_val), f'Loop carried variable {name} changed type'
+        assert type(loop_val) is type(live_val), (
+            f'Loop carried variable {name} changed type, was {type(loop_val)} but is now {type(live_val)}')
         assert not _is_triton_tensor(loop_val) or loop_val.type == live_val.type, \
             f'Loop-carried variable {name} has initial type {live_val.type} '\
             f'but is re-assigned to {loop_val.type} in loop! '\
@@ -1317,15 +1318,20 @@ class CodeGenerator(ast.NodeVisitor):
         return next(unflatten_ir_values(handles, [callee_ret_type]))
 
     def call_Function(self, node, fn, args, kws):
-        if isinstance(fn, BoundJITMethod):
+        if isinstance(fn, (BoundJITMethod, BoundConstexprFunction)):
             args.insert(0, fn.__self__)
             fn = fn.__func__
         if isinstance(fn, JITFunction):
             _check_fn_args(node, fn, args)
             return self.call_JitFunction(fn, args, kws)
-        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn):
+        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn) or isinstance(
+                fn, ConstexprFunction):
             extra_kwargs = dict()
-            sig = inspect.signature(fn)
+
+            if isinstance(fn, ConstexprFunction):
+                sig = inspect.signature(fn.__call__)
+            else:
+                sig = inspect.signature(fn)
             if '_semantic' in sig.parameters:
                 extra_kwargs["_semantic"] = self.semantic
             if '_generator' in sig.parameters:
@@ -1350,7 +1356,15 @@ class CodeGenerator(ast.NodeVisitor):
         if fn in self.builtin_namespace.values():
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
-        return _apply_to_tuple_values(ret, lambda x: x) if _is_namedtuple(type(ret)) else ret
+
+        def wrap_constexpr(x):
+            if _is_triton_value(x):
+                return x
+            return constexpr(x)
+
+        if isinstance(ret, (builtins.tuple, language.tuple)):
+            return _apply_to_tuple_values(ret, wrap_constexpr)
+        return wrap_constexpr(ret)
 
     def call_Method(self, node, fn, fn_self, args, kws):
         if isinstance(fn, JITFunction):
@@ -1578,7 +1592,11 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
                               jit_fn=fn, is_kernel=True, file_name=file_name, begin_line=begin_line, options=options,
                               codegen_fns=codegen_fns, module_map=module_map, module=module, is_gluon=fn.is_gluon())
     generator.visit(fn.parse())
-    ret = generator.module
+    module = generator.module
     # module takes ownership of the context
-    ret.context = context
-    return ret
+    module.context = context
+    if not module.verify():
+        if not fn.is_gluon():
+            print(module)
+        raise RuntimeError("error encountered during parsing")
+    return module

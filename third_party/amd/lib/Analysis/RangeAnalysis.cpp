@@ -87,7 +87,7 @@ triton::AMD::TritonIntegerRangeAnalysis::maybeGetTripCount(
 namespace {
 
 constexpr int64_t kDefaultMaxTripCount = 1024;
-constexpr int64_t kDefaultMaxPrograms = 2 << 15; // 65536
+constexpr uint64_t kDefaultMaxPrograms = 1L << 31; // 2147483648
 
 void getEnclosingLoops(Operation &op, SmallVector<LoopLikeOpInterface> &ops) {
   Operation *currOp = op.getParentOp();
@@ -193,6 +193,12 @@ std::optional<ConstantIntRanges> maybeGetAssumedRange(Operation *assumption,
     APInt min, max;
     if (isSigned) {
       min = APInt::getSignedMinValue(bitWidth);
+      if (llvm::isa_and_nonnull<mlir::triton::GetProgramIdOp,
+                                mlir::triton::GetNumProgramsOp>(
+              anchor.getDefiningOp())) {
+        min = APInt::getZero(bitWidth);
+      } else
+        min = APInt::getSignedMinValue(bitWidth);
       max = APInt::getSignedMaxValue(bitWidth);
     } else {
       min = APInt::getMinValue(bitWidth);
@@ -297,6 +303,12 @@ TritonIntegerRangeAnalysis::maybeGetAssumedRange(Value anchor) const {
   unsigned bitWidth = ConstantIntRanges::getStorageBitwidth(anchor.getType());
   assert(bitWidth > 0 && "expected non-zero bitwidth");
   ConstantIntRanges constIntRange = ConstantIntRanges::maxRange(bitWidth);
+  if (llvm::isa_and_nonnull<GetProgramIdOp>(anchor.getDefiningOp())) {
+    constIntRange = ConstantIntRanges::range(
+        APInt::getZero(bitWidth),
+        APInt(bitWidth, kDefaultMaxPrograms - 1, true), true);
+  }
+
   for (auto assumption : matchingAssumptions) {
     if (auto constIntRange_ = ::maybeGetAssumedRange(assumption, anchor))
       constIntRange = constIntRange.intersection(*constIntRange_);

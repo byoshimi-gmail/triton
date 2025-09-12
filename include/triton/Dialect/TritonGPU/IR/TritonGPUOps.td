@@ -100,12 +100,6 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     DefaultValuedAttr<BoolAttr, "false">:$isVolatile
   );
 
-  let builders = [
-      OpBuilder<(ins "Value":$src, "Value":$result,
-                     "triton::CacheModifier":$cache,
-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
-  ];
-
   let results = (outs TTG_AsyncToken:$token);
 
   let extraClassDeclaration = [{
@@ -218,7 +212,7 @@ def TTG_MemDescIndexOp : TTG_Op<"memdesc_index", [Pure, MemDescViewTrait]> {
 
   let results = (outs TTG_MemDescType:$result);
 
-  let assemblyFormat = [{$src `,` $index attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
+  let assemblyFormat = [{$src `[` $index `]` attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
 
   let hasVerifier = 1;
 }
@@ -395,9 +389,6 @@ def TTG_MaskOp: TTG_Op<"mask",
     let arguments = (ins I1:$pred);
     let results = (outs Variadic<AnyType>:$result);
     let regions = (region SizedRegion<1>:$region);
-    let builders = [
-        OpBuilder<(ins "Value":$pred)>,
-    ];
 }
 
 def TTG_MaskReturnOp: TTG_Op<"mask.return",
@@ -427,6 +418,14 @@ def TTG_Fp4ToFpOp : TTG_Op<"fp4_to_fp", [Pure]> {
 
   let arguments = (ins RankedTensorOf<[I8]>:$src, I32Attr:$axis);
   let results = (outs TT_FloatTensor:$result);
+
+  let extraClassDeclaration = [{
+      static LogicalResult verifyFp4ToFp(
+        mlir::Operation *op,
+        RankedTensorType srcTy,
+        RankedTensorType resTy,
+        unsigned axis);
+  }];
 
   let assemblyFormat = [{
     $src attr-dict `:` type($src) `->` type($result)
