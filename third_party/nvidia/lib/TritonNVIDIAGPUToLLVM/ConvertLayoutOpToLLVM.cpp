@@ -172,9 +172,10 @@ struct ConvertLayoutOpSwizzlingConversion
     auto affineOffset = b.i32_val(0);
     auto maskSpanAffineOffset = 0;
     auto noPaddingOffset = [](Value v) { return v; };
+    bool isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
     for (int i = 0; i < nReps; ++i) {
       if (i > 0)
-        b.barrier();
+        targetInfo.barrier(loc, rewriter, isWarpSync);
 
       auto tileInVals =
           to_vector(ArrayRef(permutedInVals).slice(i * tileSize, tileSize));
@@ -192,7 +193,7 @@ struct ConvertLayoutOpSwizzlingConversion
             maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
         assert(succeeded(result));
       }
-      b.barrier();
+      targetInfo.barrier(loc, rewriter, isWarpSync);
       // Load
       SmallVector<Value> tileOutVals;
       // idxDst 0: ld.shared, idxDst 1: ldmatrix, idxDst 2: ldmatrix.trans
@@ -321,8 +322,8 @@ private:
     }
 
     // Cluster barrier
-    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
-    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
+    triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, false);
+    triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
 
     // Load from remote shared memory
     {
@@ -361,8 +362,8 @@ private:
     }
 
     // Cluster barrier
-    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
-    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
+    triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, false);
+    triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
 
     return success();
   }

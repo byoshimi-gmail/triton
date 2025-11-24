@@ -356,6 +356,44 @@ bool DotScaledOp::verifyOutputDims() {
   return true;
 }
 
+LogicalResult DotScaledOp::verify() {
+  auto aShape = this->getA().getType().getShape();
+  int64_t rank = aShape.size();
+
+  auto k = aShape[rank - 1];
+  if (this->getAElemType() == ScaleDotElemType::E2M1) {
+    if (this->getLhsKPack())
+      k *= 2;
+  }
+  auto cShape = this->getC().getType().getShape();
+  int64_t mDim = cShape[cShape.size() - 2];
+  int64_t nDim = cShape[cShape.size() - 1];
+
+  if (getAScale()) {
+    auto aScaleShape = getAScale().getType().getShape();
+    if (aScaleShape[rank - 2] != mDim)
+      return this->emitError(
+          "scales M dimension must match the operand M dimension");
+    int scale_factor =
+        isa<Float8E4M3FNType>(getAScale().getType().getElementType()) ? 16 : 32;
+    if (aScaleShape[rank - 1] != k / scale_factor)
+      return this->emitError("scales K dimension must match the operand K "
+                             "divided by the scale factor");
+  }
+  if (getBScale()) {
+    auto bScaleShape = getBScale().getType().getShape();
+    if (bScaleShape[rank - 2] != nDim)
+      return this->emitError(
+          "scales N dimension must match the operand N dimension");
+    int scale_factor =
+        isa<Float8E4M3FNType>(getBScale().getType().getElementType()) ? 16 : 32;
+    if (bScaleShape[rank - 1] != k / scale_factor)
+      return this->emitError("scales K dimension must match the operand K "
+                             "divided by the scale factor");
+  }
+  return success();
+}
+
 //-- MakeRangeOp --
 OpFoldResult MakeRangeOp::fold(FoldAdaptor adaptor) {
   // make_range(start, start + 1) -> constant(start)
@@ -465,7 +503,6 @@ static LogicalResult verifyRegionsImpl(Op &op) {
                             << " arguments, but given block with "
                             << block.getNumArguments() << " arguments";
   }
-  unsigned i = 0;
   const auto &blockArgTypes = block.getArgumentTypes();
   for (unsigned i = 0; i < numArgs; ++i) {
     const auto &blockArgTy = blockArgTypes[i];
@@ -737,10 +774,10 @@ LogicalResult ExpandDimsOp::canonicalize(ExpandDimsOp op,
 
     auto newExpandTy = RankedTensorType::get(
         newExpandShape, srcTy.getElementType(), newExpandEnc);
-    auto newExpand = rewriter.create<ExpandDimsOp>(op.getLoc(), newExpandTy,
-                                                   src, op.getAxis());
-    auto newBroadcast = rewriter.create<BroadcastOp>(
-        broadcast.getLoc(), op.getType(), newExpand.getResult());
+    auto newExpand = ExpandDimsOp::create(rewriter, op.getLoc(), newExpandTy,
+                                          src, op.getAxis());
+    auto newBroadcast = BroadcastOp::create(
+        rewriter, broadcast.getLoc(), op.getType(), newExpand.getResult());
     rewriter.replaceOp(op, {newBroadcast.getResult()});
     return success();
   }
@@ -966,7 +1003,7 @@ LogicalResult BroadcastOp::verify() {
   if (srcShape.size() != resultShape.size()) {
     return emitError("rank of source must be same as rank of result");
   }
-  for (int i = 0; i < srcShape.size(); i++) {
+  for (size_t i = 0; i < srcShape.size(); i++) {
     if (srcShape[i] != 1 && srcShape[i] != resultShape[i]) {
       return emitError("Different dimensions at index ")
              << i << " between source and result.  "
@@ -1020,8 +1057,8 @@ OpFoldResult AdvanceOp::fold(FoldAdaptor adaptor) {
 //-- MakeTensorDescOp --
 void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
                              Value base, ValueRange shape, ValueRange strides,
-                             ArrayRef<int32_t> blockShape,
-                             bool isSignedInteger) {
+                             ArrayRef<int32_t> blockShape, bool isSignedInteger,
+                             triton::PaddingOption padding) {
   auto ptrTy = dyn_cast<triton::PointerType>(base.getType());
   if (!ptrTy) {
     llvm::report_fatal_error("Expected pointer type");
@@ -1031,7 +1068,8 @@ void MakeTensorDescOp::build(OpBuilder &builder, OperationState &state,
   auto blockTy = RankedTensorType::get(blockShape64, elemTy);
   auto descTy =
       TensorDescType::get(builder.getContext(), blockTy, isSignedInteger);
-  return build(builder, state, descTy, base, shape, strides);
+  auto paddingAttr = PaddingOptionAttr::get(builder.getContext(), padding);
+  return build(builder, state, descTy, base, shape, strides, paddingAttr);
 }
 
 // The following ops, including `call`, `func`, and `return` are copied and
@@ -1288,7 +1326,7 @@ LogicalResult GatherOp::verify() {
   if (getAxis() >= srcTy.getRank()) {
     return emitOpError("gather dimension must be less than the input rank");
   }
-  for (int dim = 0; dim < indicesTy.getRank(); ++dim) {
+  for (uint32_t dim = 0; dim < indicesTy.getRank(); ++dim) {
     if (dim == getAxis())
       continue;
     if (indicesTy.getShape()[dim] != srcTy.getShape()[dim]) {

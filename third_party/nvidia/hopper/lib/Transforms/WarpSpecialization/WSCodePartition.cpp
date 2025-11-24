@@ -359,25 +359,16 @@ void groupChannels(
 
   // Reorder channels associated with one entry based on program order of the
   // producers.
-  for (auto &kv : consumerChannels) {
-    if (kv.second.size() > 1) {
-      auto &allOps = kv.second.front()->getSrcOp()->getBlock()->getOperations();
-      std::sort(
-          kv.second.begin(), kv.second.end(), [&](Channel *a, Channel *b) {
-            auto itrA =
-                std::find_if(allOps.begin(), allOps.end(), [&](Operation &op) {
-                  Operation *opPointer = &op;
-                  return opPointer == a->getSrcOp();
-                });
-            auto itrB =
-                std::find_if(allOps.begin(), allOps.end(), [&](Operation &op) {
-                  Operation *opPointer = &op;
-                  return opPointer == b->getSrcOp();
-                });
-            assert(itrA != allOps.end() && itrB != allOps.end());
-            return std::distance(itrA, itrB) < 0;
-          });
+  for (auto &group : make_second_range(consumerChannels)) {
+    auto &allOps = group.front()->getSrcOp()->getBlock()->getOperations();
+    DenseMap<Operation *, size_t> opIdx;
+    opIdx.reserve(allOps.size());
+    for (auto [idx, op] : enumerate(allOps)) {
+      opIdx[&op] = idx;
     }
+    sort(group, [&](Channel *a, Channel *b) {
+      return opIdx[a->getSrcOp()] < opIdx[b->getSrcOp()];
+    });
   }
 
   // Switch to using channel as the key instead of ops as ops can be volatile.
@@ -549,9 +540,7 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
       triton::gpu::SharedMemorySpaceAttr::get(funcOp.getContext());
   Location loc = funcOp.getLoc();
   auto context = funcOp.getContext();
-  auto barrierCTALayout =
-      ttg::CTALayoutAttr::get(context, /*CTAsPerCGA=*/{1},
-                              /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+  auto barrierCTALayout = ttg::CTAEncodingAttr::getDefault(context, 1);
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCTALayout);
   Type barrierMemDescType = ttg::MemDescType::get(
@@ -560,13 +549,13 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   Type singleBarrierMemDescType =
       ttg::MemDescType::get({1}, builder.getI64Type(), barrierEncoding,
                             sharedMemorySpace, /*mutableMemory=*/true);
-  Value barrierAlloc = builder.create<mlir::triton::gpu::LocalAllocOp>(
-      loc, barrierMemDescType, Value());
+  Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
+      builder, loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
-    Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
-    Value barrierView = builder.create<ttg::MemDescIndexOp>(
-        loc, singleBarrierMemDescType, barrierAlloc, idx);
-    builder.create<ttng::InitBarrierOp>(funcOp->getLoc(), barrierView, 1);
+    Value idx = arith::ConstantIntOp::create(builder, loc, i, 32);
+    Value barrierView = ttg::MemDescIndexOp::create(
+        builder, loc, singleBarrierMemDescType, barrierAlloc, idx);
+    ttng::InitBarrierOp::create(builder, funcOp->getLoc(), barrierView, 1);
   }
   return barrierAlloc;
 }
@@ -587,6 +576,18 @@ void createToken(
   DenseMap<ttng::TCGen5MMAOp, Channel *> gen5Barriers;
   for (auto *key : orderedChannels) {
     auto it = channelsGroupedByConsumers.find(key);
+    LLVM_DEBUG({
+      LDBG("createToken key:");
+      LDBG("consumer: ");
+      key->getDstOp()->dump();
+
+      LDBG("createToken channelsGroupedByConsumers:");
+      for (auto map_key : make_first_range(channelsGroupedByConsumers)) {
+        LDBG("representative consumer: ");
+        map_key->getDstOp()->dump();
+      }
+    });
+    assert(it != channelsGroupedByConsumers.end());
     Channel *channel = it->second.front();
 
     CommChannel commChannel;
@@ -642,11 +643,11 @@ void createToken(
         }
         Value v;
         if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
-          v = builder.create<ttnvws::CreateTokenOp>(
-              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(),
+                                            channel->numBuffers, tokenLoadType);
         else
-          v = builder.create<ttnvws::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                    tokenLoadType);
+          v = ttnvws::CreateTokenOp::create(builder, funcOp.getLoc(), 1,
+                                            tokenLoadType);
         commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
@@ -697,8 +698,8 @@ static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
   Type accMemDescType = triton::gpu::MemDescType::get(
       shape, oldRetType.getElementType(), oldRetType.getEncoding(),
       oldRetType.getMemorySpace(), /*mutableMemory=*/true);
-  return builder.create<ttng::TMEMAllocOp>(oldTMemAllocOp.getLoc(),
-                                           accMemDescType, nullptr);
+  return ttng::TMEMAllocOp::create(builder, oldTMemAllocOp.getLoc(),
+                                   accMemDescType, nullptr);
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
@@ -795,7 +796,7 @@ DenseMap<Channel *, Value> createBuffer(
       Type memdescType =
           ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
                                 sharedMemorySpace, /*mutableMemory*/ true);
-      buffer = builder.create<ttg::LocalAllocOp>(funcOp.getLoc(), memdescType);
+      buffer = ttg::LocalAllocOp::create(builder, funcOp.getLoc(), memdescType);
     } else {
       llvm_unreachable("Unexpected result type");
     }

@@ -1,8 +1,15 @@
 #include "cuda.h"
 #include <dlfcn.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+
+typedef struct {
+  PyObject_HEAD;
+  _Alignas(128) CUtensorMap tensorMap;
+} PyCUtensorMapObject;
 
 // Raises a Python exception and returns false if code is not CUDA_SUCCESS.
 static bool gpuAssert(CUresult code, const char *file, int line) {
@@ -26,7 +33,7 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
 #define CUDA_CHECK_AND_RETURN_NULL(ans)                                        \
   do {                                                                         \
     if (!gpuAssert((ans), __FILE__, __LINE__))                                 \
-      return NULL;                                                             \
+      goto cleanup;                                                            \
   } while (0)
 
 // To be used inside a Py_{BEGIN,END}_ALLOW_THREADS block.
@@ -44,7 +51,7 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
     if ((funcPointer) == NULL) {                                               \
       (funcPointer) = (initializerFunction)();                                 \
       if ((funcPointer) == NULL) {                                             \
-        return NULL;                                                           \
+        goto cleanup;                                                          \
       }                                                                        \
     }                                                                          \
   } while (0)
@@ -87,6 +94,9 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
                        warp_size, "sm_clock_rate", sm_clock_rate,
                        "mem_clock_rate", mem_clock_rate, "mem_bus_width",
                        mem_bus_width);
+
+cleanup:
+  return NULL;
 }
 
 static PyObject *loadBinary(PyObject *self, PyObject *args) {
@@ -193,13 +203,11 @@ defineGetFunctionHandle(getCuTensorMapEncodeTiledHandle,
                         cuTensorMapEncodeTiled);
 
 static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
-  int clusterDimX = -1, clusterDimY = -1, clusterDimZ = -1,
-      maxActiveClusters = -1;
+  int clusterDim = -1, maxActiveClusters = -1;
   int shared = 0;
   CUfunction func;
 
-  if (!PyArg_ParseTuple(args, "Kiiii", &func, &shared, &clusterDimX,
-                        &clusterDimY, &clusterDimZ)) {
+  if (!PyArg_ParseTuple(args, "Kii", &func, &shared, &clusterDim)) {
     return NULL;
   }
 
@@ -212,13 +220,13 @@ static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
 
   CUlaunchAttribute launchAttr[1];
   launchAttr[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-  launchAttr[0].value.clusterDim.x = clusterDimX;
-  launchAttr[0].value.clusterDim.y = clusterDimY;
-  launchAttr[0].value.clusterDim.z = clusterDimZ;
+  launchAttr[0].value.clusterDim.x = clusterDim;
+  launchAttr[0].value.clusterDim.y = 1;
+  launchAttr[0].value.clusterDim.z = 1;
   CUlaunchConfig config;
-  config.gridDimX = clusterDimX;
-  config.gridDimY = maxActiveBlocks * clusterDimY;
-  config.gridDimZ = clusterDimZ;
+  config.gridDimX = clusterDim * maxActiveBlocks;
+  config.gridDimY = 1;
+  config.gridDimZ = 1;
   config.blockDimX = 128;
   config.blockDimY = 1;
   config.blockDimZ = 1;
@@ -238,6 +246,9 @@ static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
       cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &config));
   Py_END_ALLOW_THREADS;
   return PyLong_FromLong(maxActiveClusters);
+
+cleanup:
+  return NULL;
 }
 
 static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
@@ -276,12 +287,46 @@ static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
   }
 
   Py_END_ALLOW_THREADS;
-  Py_INCREF(Py_None);
-  return Py_None;
+  Py_RETURN_NONE;
 }
 
+static PyObject *PyCUtensorMap_alloc(PyTypeObject *type, Py_ssize_t n_items) {
+  PyCUtensorMapObject *self = NULL;
+  void *mem = NULL;
+  size_t size = type->tp_basicsize;
+
+  if (posix_memalign(&mem, 128, size) != 0) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+
+  self = (PyCUtensorMapObject *)mem;
+  PyObject_INIT(self, type);
+  return (PyObject *)self;
+}
+
+static void PyCUtensorMap_dealloc(PyObject *self) {
+  Py_TYPE(self)->tp_free(self);
+}
+
+static void PyCUtensorMap_free(void *ptr) { free(ptr); }
+
+// clang-format off
+static PyTypeObject PyCUtensorMapType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "triton.backends.nvidia.PyCUtensorMap",
+    .tp_basicsize = sizeof(PyCUtensorMapObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "<PyCUtensorMap object>",
+    .tp_new = PyType_GenericNew,
+    .tp_alloc = PyCUtensorMap_alloc,
+    .tp_dealloc = (destructor)PyCUtensorMap_dealloc,
+    .tp_free = PyCUtensorMap_free,
+};
+// clang-format on
+
 static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
-  unsigned long long desc_address;
   unsigned long long global_address;
   int swizzle;
   int elemSize;
@@ -289,17 +334,22 @@ static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
   PyObject *blockSize;
   PyObject *shape;
   PyObject *strides;
+  int padding;
 
-  if (!PyArg_ParseTuple(args, "KKiiiOOO", &desc_address, &global_address,
-                        &swizzle, &elemSize, &elemType, &blockSize, &shape,
-                        &strides)) {
+  if (!PyArg_ParseTuple(args, "KiiiOOOi", &global_address, &swizzle, &elemSize,
+                        &elemType, &blockSize, &shape, &strides, &padding)) {
+    return NULL;
+  }
+
+  PyCUtensorMapObject *desc = (PyCUtensorMapObject *)PyObject_CallObject(
+      (PyObject *)&PyCUtensorMapType, NULL);
+  if (!desc) {
     return NULL;
   }
 
   PyObject *blockSizeFast = NULL;
   PyObject *shapeFast = NULL;
   PyObject *stridesFast = NULL;
-  PyObject *result = NULL;
 
   uint32_t blockSizeInt[5];
   uint64_t shapeInt[5];
@@ -361,22 +411,70 @@ static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
   Py_DECREF(stridesFast);
   stridesFast = NULL;
 
+  CUtensorMapFloatOOBfill fill =
+      (padding == 1) ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+                     : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
   uint32_t elementStrides[5] = {1, 1, 1, 1, 1};
   static cuTensorMapEncodeTiled_t cuTensorMapEncodeTiled = NULL;
   INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeTiled,
                                       getCuTensorMapEncodeTiledHandle);
-  CUDA_CHECK_AND_RETURN_NULL(cuTensorMapEncodeTiled(
-      (CUtensorMap *)desc_address, elemType, rank, (void *)global_address,
-      shapeInt, stridesLL, blockSizeInt, elementStrides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-  Py_RETURN_NONE;
+  CUresult res = cuTensorMapEncodeTiled(
+      &desc->tensorMap, elemType, rank, (void *)global_address, shapeInt,
+      stridesLL, blockSizeInt, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
+  if (res != CUDA_SUCCESS) {
+    const char *str;
+    cuGetErrorString(res, &str);
+    char err[4096] = {0};
+    size_t off = 0;
+    off += snprintf(
+        err + off, sizeof(err) - off,
+        "Triton Error [CUDA]: Failed to create tensor map descriptor: %s\n",
+        str ? str : "Unknown error");
+    off += snprintf(err + off, sizeof(err) - off,
+                    "elemType=%d rank=%d global_address=0x%llx elemSize=%d "
+                    "swizzle=%d padding=%d\n",
+                    elemType, rank, (unsigned long long)global_address,
+                    elemSize, swizzle, padding);
+    off += snprintf(err + off, sizeof(err) - off, "shape=[");
+    for (int i = 0; i < rank; ++i) {
+      off +=
+          snprintf(err + off, sizeof(err) - off, "%llu%s",
+                   (unsigned long long)shapeInt[i], (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "strides=[");
+    for (int i = 0; i < rank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%llu%s",
+                      (unsigned long long)stridesLL[i],
+                      (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "blockSize=[");
+    for (int i = 0; i < rank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%u%s",
+                      (unsigned)blockSizeInt[i], (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "] elementStrides=[");
+    for (int i = 0; i < rank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%u%s",
+                      (unsigned)elementStrides[i], (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    PyErr_SetString(PyExc_RuntimeError, err);
+
+    goto cleanup;
+  }
+
+  return (PyObject *)desc;
 
 cleanup:
   Py_XDECREF(blockSizeFast);
   Py_XDECREF(shapeFast);
   Py_XDECREF(stridesFast);
-  return result;
+  Py_XDECREF(desc);
+  return NULL;
 }
 
 static PyMethodDef ModuleMethods[] = {
@@ -403,12 +501,18 @@ static struct PyModuleDef ModuleDef = {PyModuleDef_HEAD_INIT, "cuda_utils",
                                        ModuleMethods};
 
 PyMODINIT_FUNC PyInit_cuda_utils(void) {
+  if (PyType_Ready(&PyCUtensorMapType) < 0) {
+    return NULL;
+  }
+
   PyObject *m = PyModule_Create(&ModuleDef);
   if (m == NULL) {
     return NULL;
   }
 
   PyModule_AddFunctions(m, ModuleMethods);
+  Py_INCREF(&PyCUtensorMapType);
+  PyModule_AddObject(m, "PyCUtensorMap", (PyObject *)&PyCUtensorMapType);
 
   return m;
 }

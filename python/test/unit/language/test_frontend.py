@@ -308,7 +308,36 @@ def test_aggregate_with_constexpr():
     # CHECK: arith.addi %arg0, %cst : tensor<4xi32>
 
 
-@tl.constexpr_function
+@tl.core._aggregate
+class AggregateWithTuple:
+    a: tl.tuple
+
+    @triton.constexpr_function
+    def __init__(self, a):
+        self.a = tl.tuple((a, ))
+
+    @staticmethod
+    @triton.jit
+    def create(a):
+        return AggregateWithTuple(a)
+
+
+@triton.jit
+def pass_tuple_aggregate(agg):
+    pass
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_with_tuple():
+    # CHECK-LABEL: test_aggregate_with_tuple
+    # CHECK: tt.call @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
+    agg = AggregateWithTuple.create(tl.arange(0, 4))
+    pass_tuple_aggregate(agg)
+    # CHECK: tt.func private @"test_frontend.pass_tuple_aggregate__test_frontend.AggregateWithTuple<Ti32S4ST>__"
+
+
+@triton.constexpr_function
 def constexpr_function(x):
     return x + 1
 
@@ -345,12 +374,12 @@ def test_reassign_aggregate_with_constexpr():
     agg = agg.modify(tl.arange(4, 8))
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def make_shape(m, n):
     return (m, n)
 
 
-@tl.constexpr_function
+@triton.constexpr_function
 def add_shape_dims(m, n):
     return m + n
 
@@ -365,64 +394,7 @@ def test_constexpr_getitem():
     tl.arange(4, sum)
 
 
-@tl.constexpr_function
-def make_constexpr_closure(x):
-    x = tl.constexpr(x)
-
-    @triton.jit
-    def inner(shape: tl.constexpr):
-        return tl.full(shape, x, dtype=tl.int32)
-
-    return inner
-
-
-@filecheck_test
-@triton.jit
-def test_constexpr_closure():
-    # CHECK-LABEL: test_constexpr_closure
-    closure: tl.constexpr = make_constexpr_closure(42)
-
-    # CHECK: arith.constant dense<42> : tensor<128x128xi32>
-    closure((128, 128))
-
-
-@tl.constexpr_function
-def make_constexpr_generator(f):
-    f = tl.constexpr(f)
-
-    @triton.jit
-    def inner(lhs):
-        return lhs + f(lhs.shape, lhs.dtype)
-
-    return inner
-
-
-@triton.jit
-def inner_function(shape: tl.constexpr, dtype: tl.constexpr):
-    return tl.full(shape, 42, dtype)
-
-
-@filecheck_test
-@triton.jit
-def test_constexpr_generator():
-    # CHECK: func public @test_constexpr_generator
-    # CHECK:   [[RANGE:%.*]] = tt.make_range {end = 128 : i32, start = 0 : i32}
-    # CHECK:   call @{{.*}}make_constexpr_generator.<locals>.inner{{.*}}([[RANGE]])
-
-    # CHECK: func private @{{.*}}make_constexpr_generator.<locals>.inner
-    # CHECK:   [[RHS:%.*]] = tt.call @{{.*}}inner_function
-    # CHECK:   [[RESULT:%.*]] = arith.addi %arg0, [[RHS]]
-    # CHECK:   return [[RESULT]]
-
-    # CHECK: func private @{{.*}}inner_function
-    # CHECK:   %cst = arith.constant dense<42> : tensor<128xi32>
-    # CHECK:   return %cst
-    generator: tl.constexpr = make_constexpr_generator(inner_function)
-    lhs = tl.arange(0, 128)
-    generator(lhs)
-
-
-@tl.constexpr_function
+@triton.constexpr_function
 def Box(T):
 
     @tl.core._aggregate
@@ -507,7 +479,7 @@ def test_return_in_while():
             i += 1
 
     with pytest.raises(CompilationError) as e:
-        kernel.warmup(grid=(1, ))
+        run_parser(kernel)
 
     assert "Cannot have `return` statements inside `while` or `for` statements in triton" in str(e.value)
 
@@ -531,4 +503,109 @@ def foo(test: TestTuple):
 
 def test_tuple_constexpr():
     test = TestTuple(test=TensorPtr(tl.constexpr(1)))
-    _ = foo.warmup(test, grid=(1, 0))
+    run_parser(foo, args=(test, ))
+
+
+@tl.core._aggregate
+class AggregateWithConstexprFunction:
+    val: tl.constexpr
+    val_squared: tl.constexpr
+
+    def __init__(self, val):
+        self.val = tl.constexpr(val)
+        self.val_squared = tl.constexpr(self.square_val())
+
+    @triton.constexpr_function
+    def square_val(self):
+        return self.val * self.val
+
+
+@filecheck_test
+@triton.jit
+def test_aggregate_constexpr_function():
+    agg = AggregateWithConstexprFunction(4)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_4_
+    anchor(agg.val)
+
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
+    anchor(agg.val_squared)
+
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_16_
+    anchor(agg.square_val())
+
+
+@tl.core.builtin
+def make_list(*args, _semantic=None):
+    return list(args)
+
+
+@triton.constexpr_function
+def function_taking_list(arg):
+    return arg[1]
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_function_taking_list():
+    a: tl.constexpr = function_taking_list(make_list(4, 8, 16))
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_8_
+    anchor(a)
+
+
+@filecheck_test
+@triton.jit
+def test_constexpr_min_max():
+    a: tl.constexpr = min(1, 2)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_1_
+    anchor(a)
+
+    b: tl.constexpr = min(1, 2, -3)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_-3_
+    anchor(b)
+
+    c: tl.constexpr = max(3, 4)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_4_
+    anchor(c)
+
+    d: tl.constexpr = max(3, 4, 5)
+    # CHECK: call @{{.*}}anchor{{.*}}cconstexpr_5_
+    anchor(d)
+
+
+def test_constexpr_min_error():
+
+    @triton.jit
+    def min_kernel(a: tl.constexpr, b: tl.constexpr):
+        min(a, b)
+
+    with pytest.raises(CompilationError):
+        run_parser(min_kernel, args=(1.0, float("nan")))
+
+    with pytest.raises(CompilationError):
+        run_parser(min_kernel, args=(1.0, -0.0))
+
+
+def test_constexpr_max_error():
+
+    @triton.jit
+    def max_kernel(a: tl.constexpr, b: tl.constexpr):
+        max(a, b)
+
+    with pytest.raises(CompilationError):
+        run_parser(max_kernel, args=(1.0, float("nan")))
+
+    with pytest.raises(CompilationError):
+        run_parser(max_kernel, args=(1.0, -0.0))
+
+
+@filecheck_test
+@triton.jit
+def test_for_loop_iv_modification():
+    # CHECK: scf.for %[[I:.*]] = {{.*}} to {{.*}} step {{.*}} : i32 {
+    for i in range(4):
+        # CHECK: anchor{{.*}}%[[I]]
+        anchor(i)
+        # CHECK: %[[I2:.*]] = arith.addi %[[I]], %{{.*}} : i32
+        i += 1
+        # CHECK: anchor{{.*}}%[[I2]]
+        anchor(i)

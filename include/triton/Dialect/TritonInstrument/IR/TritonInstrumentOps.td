@@ -29,7 +29,7 @@ def TTI_ExperimentalAssertInThreadOp : TTI_Op<"experimental_assert_in_thread", [
     If check_any is true, any of the values in the condition must be true. Otherwise, all the
     values in the condition must be true.
   }];
-  let arguments = (ins I1Tensor:$condition, StrAttr:$message, BoolAttr:$check_any);
+  let arguments = (ins AnyTypeOf<[I1, I1Tensor]>:$condition, StrAttr:$message, BoolAttr:$check_any);
   let assemblyFormat = "$condition `,` $message attr-dict `:` type($condition)";
 }
 
@@ -46,250 +46,48 @@ def TTI_ExperimentalBufferPointersOp : TTI_Op<"experimental_buffer_pointers", [P
   }];
 }
 
-
-def TTI_ExperimentalCheckWriteStateOp : TTI_Op<"experimental_check_write_state", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "check if there are outstanding writes to a buffer guarded by a mbar";
+def TTI_ExperimentalMemDescToI64Op : TTI_Op<"experimental_memdesc_to_i64", [Pure]> {
+  let summary = "Convert a memdesc into its base pointer as i64";
   let description = [{
-    Check if the writeState tensor has non-zero value associated with the buffer.
-
-    `writeState` is a tensor of 8b bitfields, where:
-    - bit 0: 1 if the buffer is being written to
-    - bit 1: 1 if the write is *not* hwPipelined
-
-    If hwPipelined is true, shift the bitfield by 1 to check the second bit - this
-    means that the error won't be triggered if another pipelined write is outstanding.
+    Extract the base pointer from the given memdesc and return it as a 64-bit
+    integer. This can be used to compare the memdesc against tensors of barrier
+    pointers maintained by the concurrency sanitizer.
   }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TT_Tensor:$buffers,
-    TT_PtrLike:$writeBars,
-    TypeAttr:$writeBarsType,
-    TT_PtrLike:$writeState,
-    TypeAttr:$writeStateType,
-    I1Attr:$hwPipelined,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $buf `{` $buffers `,` $writeBars `(` $writeBarsType `)` `,` $writeState `(` $writeStateType `)` `}` (`,` $pred^)? `pipelined` $hwPipelined attr-dict `:` type($buf) `,` type($buffers) `,` type($writeBars) `,` type($writeState)
-  }];
-  let hasVerifier = 1;
+  let arguments = (ins TTG_MemDescType:$memdesc);
+  let results = (outs I64:$result);
+  let builders = [
+    OpBuilder<(ins "Value":$memdesc), [{
+      build($_builder, $_state, $_builder.getI64Type(), memdesc);
+    }]>
+  ];
+  let assemblyFormat = "$memdesc attr-dict `:` type($memdesc)";
 }
 
 
-def TTI_ExperimentalCheckReadBarriersOp : TTI_Op<"experimental_check_read_barriers", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "check if there are outstanding reads from a buffer guarded by a mbar";
+// ===== Critical section lock ops =====
+
+
+def TTI_ExperimentalLockAcquireOp : TTI_Op<"experimental_lock_acquire", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Acquire a lock.";
   let description = [{
-    Check if there are outstanding reads from a buffer guarded by a mbar.
+    Enter a critical section by acquiring a lock with single thread.
   }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TT_Tensor:$buffers,
-    TT_PtrLike:$readBars,
-    TypeAttr:$readBarsType,
-    Optional<I1>:$pred
-  );
+  let arguments = (ins TT_PtrLike:$lock, Optional<I1>:$pred);
   let assemblyFormat = [{
-    $buf `{` $buffers `,` $readBars `(` $readBarsType `)` `}` (`,` $pred^)? attr-dict `:` type($buf) `,` type($buffers) `,` type($readBars)
+    $lock (`,` $pred^)? attr-dict `:` type($lock)
   }];
-  let hasVerifier = 1;
 }
 
 
-def TTI_ExperimentalSetWriteStateOp : TTI_Op<"experimental_set_write_state", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "mark a buffer as being written in writeState tensor";
+def TTI_ExperimentalLockReleaseOp : TTI_Op<"experimental_lock_release", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Release a lock.";
   let description = [{
-    Mark a buffer as being written to. It is not yet tracked by a barrier, until
-    `commit_write_with_barrier` is called, at which point all the buffers being written
-    to are marked as tracked by the barrier.
-
-    `writeState` is a tensor of 8b bitfields, where:
-    - bit 0: 1 if the buffer is being written to
-    - bit 1: 1 if the write is *not* hwPipelined
-
-    If hwPipelined is true, the write won't trigger an error if another pipelined
-    write is executed later without waiting for the barrier.
+    Leave a critical section by releasing a lock with single thread.
   }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TT_Tensor:$buffers,
-    TT_PtrLike:$writeState,
-    TypeAttr:$writeStateType,
-    I1Attr:$hwPipelined,
-    Optional<I1>:$pred
-  );
+  let arguments = (ins TT_PtrLike:$lock, Optional<I1>:$pred);
   let assemblyFormat = [{
-    $buf `{` $buffers `,` $writeState `(` $writeStateType `)` `}` (`,` $pred^)? `pipelined` $hwPipelined attr-dict `:` type($buf) `,` type($buffers) `,` type($writeState)
+    $lock (`,` $pred^)? attr-dict `:` type($lock)
   }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalCommitWriteWithBarrierOp : TTI_Op<"experimental_commit_write_with_barrier", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "Mark all buffers being currently written as tracked by the barrier.";
-  let description = [{
-    For all buffers currently marked in writeState tensor, mark them as tracked by the mbar in
-    writeBars tensor.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$mbar,
-    TT_Tensor:$barriers,
-    TT_PtrLike:$writeBars,
-    TypeAttr:$writeBarsType,
-    TT_PtrLike:$writeState,
-    TypeAttr:$writeStateType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $mbar `{` $barriers `,` $writeBars `(` $writeBarsType `)` `,` $writeState `(` $writeStateType `)` `}` (`,` $pred^)? attr-dict `:` type($mbar) `,` type($barriers) `,` type($writeBars) `,` type($writeState)
-  }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalSetReadBarrierOp : TTI_Op<"experimental_set_read_barrier", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "mark a buffer as being read from using mbar as a guard";
-  let description = [{
-    Mark a buffer as being read from using mbar as a guard.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TTG_MemDescType:$mbar,
-    TT_Tensor:$buffers,
-    TT_Tensor:$barriers,
-    TT_PtrLike:$readBars,
-    TypeAttr:$readBarsType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $buf `,` $mbar `{` $buffers `,` $barriers `,` $readBars `(` $readBarsType `)` `}` (`,` $pred^)? attr-dict `:` type($buf) `,` type($mbar) `,` type($buffers) `,` type($barriers) `,` type($readBars)
-  }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalClearWriteBarrierOp : TTI_Op<"experimental_clear_write_barrier", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "clear the write state for buffers being guarded by an mbar";
-  let description = [{
-    Clear the write state for buffers being guarded by an mbar.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$mbar,
-    TT_Tensor:$barriers,
-    TT_PtrLike:$writeBars,
-    TypeAttr:$writeBarsType,
-    TT_PtrLike:$writeState,
-    TypeAttr:$writeStateType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $mbar `{` $barriers `,` $writeBars `(` $writeBarsType `)` `,` $writeState `(` $writeStateType `)` `}` (`,` $pred^)? attr-dict `:` type($mbar) `,` type($barriers) `,` type($writeBars) `,` type($writeState)
-  }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalClearReadBarrierOp : TTI_Op<"experimental_clear_read_barrier", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "clear the read state for buffers being guarded by an mbar";
-  let description = [{
-    Clear the read state for buffers being guarded by an mbar.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$mbar,
-    TT_Tensor:$barriers,
-    TT_PtrLike:$readBars,
-    TypeAttr:$readBarsType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $mbar `{` $barriers `,` $readBars `(` $readBarsType `)` `}` (`,` $pred^)? attr-dict `:` type($mbar) `,` type($barriers) `,` type($readBars)
-  }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalCheckBarrierWritesClearedOp : TTI_Op<"experimental_check_barrier_writes_cleared", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "verify that the barrier is not used to track any writes";
-  let description = [{
-    Verify that the barrier is not used to track any writes.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$mbar,
-    TT_Tensor:$barriers,
-    TT_PtrLike:$writeBars,
-    TypeAttr:$writeBarsType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $mbar `{` $barriers `,` $writeBars `(` $writeBarsType `)` `}` (`,` $pred^)? attr-dict `:` type($mbar) `,` type($barriers) `,` type($writeBars)
-  }];
-  let hasVerifier = 1;
-}
-
-
-def TTI_ExperimentalStageAccessForCommitOp : TTI_Op<"experimental_stage_access_for_commit", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "";
-  let description = [{
-    For operations that use `outstanding` to track the number of outstanding commits (rather than mbarriers),
-    mark the buffer as being accessed, but not commited yet, by marking it with `-1`.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TT_Tensor:$buffers,
-    TT_PtrLike:$outstandingCommits,
-    TypeAttr:$outstandingCommitsType,
-    Optional<I1>:$pred
-  );
-  let assemblyFormat = [{
-    $buf `{` $buffers `,` $outstandingCommits `(` $outstandingCommitsType `)` `}` (`,` $pred^)? attr-dict `:` type($buf) `,` type($buffers) `,` type($outstandingCommits)
-  }];
-  let hasVerifier = 1;
-}
-
-def TTI_ExperimentalCommitAccessesOp : TTI_Op<"experimental_commit_accesses", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "Commit all the staged accesses for all the buffers.";
-  let description = [{
-    Commit all the staged accesses for all the buffers.
-  }];
-  let arguments = (ins
-    TT_PtrLike:$outstandingCommits,
-    TypeAttr:$outstandingCommitsType,
-    Optional<I1>:$pred);
-  let assemblyFormat = [{
-    `{` $outstandingCommits `(` $outstandingCommitsType `)` `}` (`,` $pred^)? attr-dict `:` type($outstandingCommits)
-  }];
-}
-
-def TTI_ExperimentalClearOutstandingCommitsOp : TTI_Op<"experimental_clear_outstanding_commits", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "Clear all the outstanding commits more distant than `outstandingNum.";
-  let description = [{
-    Clear all the outstanding commits more distant than `outstandingNum` from the current thread.
-  }];
-  let arguments = (ins
-    TT_PtrLike:$outstandingCommits,
-    TypeAttr:$outstandingCommitsType,
-    I32Attr:$outstandingNum,
-    Optional<I1>:$pred);
-  let assemblyFormat = [{
-    `{` $outstandingCommits `(` $outstandingCommitsType `)` `}` `,` $outstandingNum (`,` $pred^)? attr-dict `:` type($outstandingCommits)
-  }];
-}
-
-def TTI_ExperimentalCheckOutstandingCommitsOp : TTI_Op<"experimental_check_outstanding_commits", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "Check if the buffer has an outstanding commit.";
-  let description = [{
-    Check if the buffer has an outstanding commit.
-  }];
-  let arguments = (ins
-    TTG_MemDescType:$buf,
-    TT_Tensor:$buffers,
-    TT_PtrLike:$outstandingCommits,
-    TypeAttr:$outstandingCommitsType,
-    StrAttr:$pendingAccessType,
-    Optional<I1>:$pred);
-  let assemblyFormat = [{
-    $buf `{` $buffers `,` $outstandingCommits `(` $outstandingCommitsType `)` `}` `,` $pendingAccessType (`,` $pred^)? attr-dict `:` type($buf) `,` type($buffers) `,` type($outstandingCommits)
-  }];
-  let hasVerifier = 1;
 }
 
 #endif // TRITONINSTRUMENT_OPS

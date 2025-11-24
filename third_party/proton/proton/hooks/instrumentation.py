@@ -1,4 +1,3 @@
-import functools
 from typing import Dict, Optional, Union, Any
 
 import triton
@@ -9,12 +8,11 @@ from triton._C.libtriton import nvidia as triton_nvidia
 from triton._C.libtriton import passes as triton_passes
 from triton._C.libproton import proton as libproton
 from triton.compiler import LazyDict
-from triton.runtime.jit import JITFunction
 from triton.runtime._allocation import set_profile_allocator, NullAllocator
 from triton.backends import backends
 
 from .hook import Hook
-from ..flags import set_instrumentation_on, set_instrumentation_off
+from ..flags import flags
 from .. import mode
 
 # TODO(fywkevin): add support for major.minor
@@ -151,7 +149,7 @@ class InstrumentationHook(Hook):
 
         InstrumentationHook.active_count += 1
 
-        set_instrumentation_on()
+        flags.instrumentation_on = True
 
         device = triton.runtime.driver.active.get_current_device()
         max_shared_mem = triton.runtime.driver.active.utils.get_device_properties(device)["max_shared_mem"]
@@ -193,16 +191,8 @@ class InstrumentationHook(Hook):
         # Set up the profiling allocator
         set_profile_allocator(self.allocator)
 
-        original_run = JITFunction.run
-
-        original_mode = self.mode
-
-        @functools.wraps(original_run)
-        def instrumented_run(self, *args, **kwargs):
-            kwargs["instrumentation_mode"] = str(original_mode)
-            return original_run(self, *args, **kwargs)
-
-        JITFunction.run = instrumented_run
+        # Set the instrumentation mode
+        triton.knobs.compilation.instrumentation_mode = str(self.mode)
 
     def deactivate(self):
         if InstrumentationHook.active_count == 0:
@@ -216,23 +206,21 @@ class InstrumentationHook(Hook):
         backends[backend_name].compiler.instrumentation = {}
 
         # No runtime instrumentation hook is active anymore
-        set_instrumentation_off()
+        flags.instrumentation_on = False
 
-        # Restore original JIT function run method
-        if hasattr(JITFunction.run, "__wrapped__"):
-            JITFunction.run = JITFunction.run.__wrapped__
+        # Restore the instrumentation mode
+        triton.knobs.compilation.instrumentation_mode = ""
 
         # Reset profile allocator
         set_profile_allocator(NullAllocator())
 
         # Reset host memory for external processing
-        if InstrumentationHook.enable_host_buffer:
-            InstrumentationHook.host_buffer = None
+        InstrumentationHook.host_buffer = None
 
         # Reset the buffer reference
         self.buffer = None
 
-    def init_handle(self, module: Any, function: Any, name: str, metadata_group: Dict[str, str]) -> None:
+    def init_handle(self, module: Any, function: Any, name: str, metadata_group: Dict[str, str], hash: str) -> None:
         if not function:
             return
 
@@ -262,17 +250,17 @@ class InstrumentationHook(Hook):
     def _data_ptr(self) -> int:
         return 0 if self.buffer is None else self.buffer.data_ptr()
 
-    def enter(self, lazy_dict: LazyDict) -> None:
-        func = lazy_dict.data.get("function")
-        stream = lazy_dict.data.get("stream")
+    def enter(self, metadata: LazyDict) -> None:
+        func = metadata.data.get("function")
+        stream = metadata.data.get("stream")
         alloc_size = 0 if self.buffer is None else self.buffer.element_size() * self.buffer.numel()
         libproton.enter_instrumented_op(stream, func, self._data_ptr(), alloc_size)
         if InstrumentationHook.enable_host_buffer:
             InstrumentationHook.host_buffer = None
 
-    def exit(self, lazy_dict: LazyDict) -> None:
-        func = lazy_dict.data.get("function")
-        stream = lazy_dict.data.get("stream")
+    def exit(self, metadata: LazyDict) -> None:
+        func = metadata.data.get("function")
+        stream = metadata.data.get("stream")
         alloc_size = 0 if self.buffer is None else self.buffer.element_size() * self.buffer.numel()
         libproton.exit_instrumented_op(stream, func, self._data_ptr(), alloc_size)
 

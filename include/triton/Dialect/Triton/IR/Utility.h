@@ -1,6 +1,8 @@
 #ifndef TRITON_IR_UTILITY_H_
 #define TRITON_IR_UTILITY_H_
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
@@ -9,6 +11,14 @@ namespace mlir {
 
 // Bitwidth of pointers
 constexpr int kPtrBitWidth = 64;
+
+// Returns the bit width of a type, treating pointer-like types as 64-bit.
+// This handles LLVM dialect pointer types.
+inline int getIntOrFloatOrPtrBitWidth(Type type) {
+  if (isa<LLVM::LLVMPointerType, triton::PointerType>(type))
+    return kPtrBitWidth;
+  return type.getIntOrFloatBitWidth();
+}
 
 template <typename T, typename U> SmallVector<T> convertType(ArrayRef<U> in) {
   SmallVector<T> out;
@@ -23,7 +33,7 @@ SmallVector<T> convertType(const VecU &in) {
 }
 
 template <typename Int> Int product(llvm::ArrayRef<Int> arr) {
-  return std::accumulate(arr.begin(), arr.end(), 1, std::multiplies{});
+  return std::accumulate(arr.begin(), arr.end(), 1, std::multiplies<Int>());
 }
 template <typename VecT> auto product(const VecT &vec) {
   return product(llvm::ArrayRef(vec));
@@ -132,8 +142,8 @@ template <typename VecT, typename IdxT>
 // Is `vec` [0, 1, ..., n]?  Returns true on empty list.
 template <typename T> bool isIota(ArrayRef<T> vec) {
   static_assert(std::is_integral_v<T>);
-  for (T i = 0; i < vec.size(); ++i) {
-    if (vec[i] != i) {
+  for (size_t i = 0; i < vec.size(); ++i) {
+    if (vec[i] != static_cast<T>(i)) {
       return false;
     }
   }
@@ -190,6 +200,14 @@ bool isHostSideDescriptor(Value v);
 bool isKernel(FunctionOpInterface funcOp);
 
 unsigned getBitwidth(RankedTensorType ty);
+
+// If the value "anchor" is compared against a statically-computed bound, return
+// inclusive lower and upper bounds lb <= anchor <= ub. Depending on the
+// compariosn operator, one of the bounds is a computed one while the other is
+// derived from the data type of anchor.
+std::optional<ConstantIntRanges> getBoundFromCmpOp(arith::CmpIOp cmpOp,
+                                                   Value anchor);
+
 } // namespace triton
 } // namespace mlir
 

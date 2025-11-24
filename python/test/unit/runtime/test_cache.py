@@ -1,3 +1,4 @@
+import expecttest
 import importlib.util
 import itertools
 import os
@@ -125,6 +126,42 @@ def test_combine_fn_change():
 
         assert key not in seen_keys
         seen_keys.add(key)
+
+
+@triton.constexpr_function
+def constexpr_flag_fn():
+    return False
+
+
+@triton.jit
+def constexpr_fn_user(out):
+    a: tl.constexpr = constexpr_flag_fn()
+    tl.store(out, a)
+
+
+def test_constexpr_fn_change():
+    baseline = constexpr_fn_user.cache_key
+
+    orig_src = constexpr_flag_fn.src
+    new_src = orig_src.replace("False", "True")
+    constexpr_flag_fn._unsafe_update_src(new_src)
+    constexpr_fn_user.hash = None
+    updated = constexpr_fn_user.cache_key
+    assert baseline != updated
+
+    constexpr_flag_fn._unsafe_update_src(orig_src)
+    constexpr_fn_user.hash = None
+    assert constexpr_fn_user.cache_key == baseline
+
+
+@triton.constexpr_function
+def invalid_constexpr_fn():
+    return torch.cuda.get_device_capability()
+
+
+def test_invalid_constexpr_fn():
+    with pytest.raises(RuntimeError):
+        invalid_constexpr_fn.cache_key
 
 
 def write_and_load_module(temp_file: pathlib.Path, code, num_extra_lines):
@@ -488,19 +525,6 @@ def test_jit_noinline(device) -> None:
     assert inline_ttir != noinline_ttir
 
 
-def test_memory_leak() -> None:
-
-    @triton.jit
-    def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):
-        xnumel = 10
-        xoffset = tl.program_id(0) * XBLOCK
-        xindex = xoffset + tl.arange(0, XBLOCK)[:]
-        xmask = xindex < xnumel
-        x0 = xindex
-        tmp0 = tl.load(in_ptr0 + (x0), xmask)
-        tl.store(out_ptr0 + (x0 + tl.zeros([XBLOCK], tl.int32)), tmp0, xmask)
-
-
 def test_preload(device, fresh_triton_cache) -> None:
 
     @triton.jit
@@ -547,7 +571,6 @@ def test_preload(device, fresh_triton_cache) -> None:
 
     triton.knobs.runtime.jit_cache_hook = inc_counter
     final_kernel = kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, tl.float32, grid=(1, ))
-    triton.knobs.runtime.jit_cache_hook = None
     assert counter == 0
     assert len(kernel_add.device_caches[device][0]) == 1
     assert final_kernel.hash == hash
@@ -656,8 +679,6 @@ def test_function_arguments(device):
     def kernel(Y, fn: tl.constexpr, fn_args):
         tl.store(Y, fn(*fn_args))
 
-    triton.knobs.runtime.jit_cache_hook = None
-    triton.knobs.runtime.jit_post_compile_hook = None
     y = torch.zeros((5, ), dtype=torch.int32, device=device)
     kernel[(1, )](y[0], func1, tuple())
     kernel[(1, )](y[1], func2, tuple())
@@ -765,3 +786,42 @@ def test_async_compile(device, fresh_triton_cache):
         assert a[0, 0] == 1
         kernel[(1, )](a, 2)
         assert a[0, 0] == 2
+
+
+def test_higher_order_kernel(device, fresh_triton_cache, capsys):
+
+    @triton.jit
+    def fn_a():
+        tl.static_print("Compiling with fn_a")
+        return 0
+
+    @triton.jit
+    def kernel(out_ptr, FUNC: tl.constexpr) -> None:
+        val = FUNC()
+        tl.store(out_ptr, val)
+
+    output = torch.empty((), device=device, dtype=torch.int32)
+    kernel[(1, )](output, fn_a)
+    assert output.item() == 0
+
+    # Test we can update src in-place
+    orig_src = fn_a.src
+    new_src = orig_src.replace("with fn_a", "with fn_a after modification")
+    new_src = new_src.replace("0", "1")
+    fn_a._unsafe_update_src(new_src)
+    kernel[(1, )](output, fn_a)
+    assert output.item() == 1
+
+    # Test that the on disc cache works
+    kernel.device_caches.clear()
+    kernel[(1, )](output, fn_a)
+    assert output.item() == 1
+
+    fn_a._unsafe_update_src(orig_src)
+    kernel[(1, )](output, fn_a)
+    assert output.item() == 0
+
+    expecttest.assert_expected_inline(capsys.readouterr().out, """\
+Compiling with fn_a
+Compiling with fn_a after modification
+""")

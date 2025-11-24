@@ -49,8 +49,7 @@ createTritonGPUProxyFenceInsertionWrapper(int32_t capability) {
 }
 
 void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
-  ADD_PASS_WRAPPER_1("add_plan_cta", ttng::createTritonNvidiaGPUPlanCTAPass,
-                     mlir::triton::nvidia_gpu::ClusterInfo *);
+  ADD_PASS_WRAPPER_0("add_plan_cta", ttng::createTritonNvidiaGPUPlanCTAPass);
   ADD_PASS_WRAPPER_1("add_fence_insertion",
                      createTritonGPUFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_1("add_proxy_fence_insertion",
@@ -61,6 +60,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
                      ttng::createTritonNvidiaGPURemoveTMEMTokensPass);
+  ADD_PASS_WRAPPER_0("add_check_matmul_two_cta",
+                     ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass);
   ADD_PASS_WRAPPER_0("add_nvgpu_to_llvm",
                      mlir::triton::createConvertNVGPUToLLVM);
   ADD_PASS_WRAPPER_0("add_warp_specialize_to_llvm",
@@ -81,6 +82,10 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_warp_group",
                      mlir::triton::createNVWSLowerWarpGroup);
   ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
+  ADD_PASS_WRAPPER_0("add_assign_stage_phase",
+                     mlir::triton::createNVWSAssignStagePhase);
+  ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
+                     mlir::triton::createNVWSInsertTmemAref);
 }
 
 void init_triton_hopper_passes(py::module &&m) {
@@ -98,7 +103,8 @@ static void checkMatmulConstraints(const std::string &A_dtype,
   if (A_dtype != B_dtype || A_dtype != C_dtype) {
     throw std::runtime_error("Data types do not match.");
   }
-  if (A_dtype != "torch.float8_e4m3fn" && A_dtype != "torch.float16") {
+  if (A_dtype != "torch.float8_e4m3fn" && A_dtype != "torch.float16" &&
+      A_dtype != "torch.float32" && A_dtype != "torch.bfloat16") {
     throw std::runtime_error("Unsupported data type.");
   }
 
@@ -142,22 +148,6 @@ void init_triton_nvidia(py::module &&m) {
   init_triton_nvidia_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule("ttnvgpuir"));
   init_triton_hopper_passes(passes.def_submodule("hopper"));
-
-  // cluster info
-  py::class_<mlir::triton::nvidia_gpu::ClusterInfo>(m, "ClusterInfo")
-      .def(py::init<>())
-      .def_readwrite("clusterDimX",
-                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimX)
-      .def_readwrite("clusterDimY",
-                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimY)
-      .def_readwrite("clusterDimZ",
-                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimZ)
-      .def("__repr__", [](mlir::triton::nvidia_gpu::ClusterInfo &self) {
-        std::ostringstream oss;
-        oss << "(" << self.clusterDimX << ", " << self.clusterDimY << ", "
-            << self.clusterDimZ << ")";
-        return oss.str();
-      });
 
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
@@ -234,6 +224,15 @@ void init_triton_nvidia(py::module &&m) {
                dtype = CUDA_R_8F_E4M3;
              } else if (dtype_str == "float16") {
                dtype = CUDA_R_16F;
+             } else if (dtype_str == "float32") {
+               // Use FP32 inputs with TF32 compute in cublasLt (set in compute
+               // type)
+               dtype = CUDA_R_32F;
+             } else if (dtype_str == "bfloat16") {
+               dtype = CUDA_R_16BF;
+             } else {
+               throw std::runtime_error(
+                   "Unsupported dtype for cublasLt.matmul: " + dtype_str);
              }
 
              self.matmul(A_shape[0], B_shape[0], A_shape[1], A_ptr, B_ptr,
@@ -271,9 +270,32 @@ void init_triton_nvidia(py::module &&m) {
           dtype = CUDA_R_8F_E4M3;
         } else if (dtype_str == "float16") {
           dtype = CUDA_R_16F;
+        } else if (dtype_str == "float32") {
+          dtype = CUDA_R_32F;
+        } else if (dtype_str == "bfloat16") {
+          dtype = CUDA_R_16BF;
+        } else {
+          throw std::runtime_error("Unsupported dtype for cublasLt.gemm: " +
+                                   dtype_str);
         }
 
         self.gemm(A_shape[0], B_shape[0], A_shape[1], A_ptr, B_ptr, C_ptr,
                   D_ptr, dtype, alpha, beta);
       });
+
+  m.def("has_extern_deps", [](llvm::Module *dstMod) -> bool {
+    // `global_smem` is special cased in Triton, so we ignore it here.
+    for (const auto &g : dstMod->globals()) {
+      if (g.hasExternalLinkage() && g.getName() != "global_smem") {
+        return true;
+      }
+    }
+    for (const auto &f : *dstMod) {
+      if (f.hasExternalLinkage() && !f.hasExactDefinition() &&
+          !f.isIntrinsic()) {
+        return true;
+      }
+    }
+    return false;
+  });
 }

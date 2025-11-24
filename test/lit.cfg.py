@@ -59,8 +59,13 @@ tools = [
     'triton-opt',
     'triton-llvm-opt',
     'mlir-translate',
+    'llc',
     ToolSubst('%PYTHON', config.python_executable, unresolved='ignore'),
 ]
+
+# Static libraries are not built if LLVM_BUILD_SHARED_LIBS is ON.
+if config.build_shared_libs:
+    config.available_features.add("shared-libs")
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)
 

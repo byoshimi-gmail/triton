@@ -5,34 +5,63 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 import triton_kernels
-import triton_kernels.routing
 import triton_kernels.swiglu
-from triton_kernels.routing import RoutingData, GatherIndx, ScatterIndx, compute_expt_data
+from triton_kernels.reduce import reduce
 from triton_kernels.topk import topk
-from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
-from triton_kernels.target_info import get_cdna_version, is_hip, cuda_capability_geq
+from triton_kernels.matmul import matmul, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
+from triton_kernels.target_info import get_cdna_version, is_hip, is_cuda, cuda_capability_geq
 from triton_kernels.tensor_details import layout
+from triton_kernels.tensor import RaggedTensorMetadata, make_ragged_tensor_metadata, remap_ragged_tensor_metadata
+from triton_kernels.distributed import make_expt_dict_uniform, make_expt_assignment, convert_dp_to_ep, convert_ep_to_dp, ExptAssignment, symm_mem_pool
 
 from bench_utils import quantize_weight
-
-# The following dummy methods simulate the behavior of distributed operations
-# in a non-distributed environment for testing purposes.
-# Assuming each rank has the same data for simplicity.
 
 
 @dataclass
 class ReduceScatterMetadata:
-    input_split_sizes: list[int]
-    ep_indx: torch.Tensor
-    EP: int = 1
-    TP: int = 1
+    mode: str
+    active_indx: Optional[torch.Tensor] = None
+    dispatch_indx: Optional[torch.Tensor] = None
+    combine_indx: Optional[torch.Tensor] = None
 
 
 def _is_distributed_launch() -> bool:
     return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def create_expt_assignment(EP: int, n_expts_tot: int, device: torch.device) -> Optional[ExptAssignment]:
+    if not _is_distributed_launch():
+        return None
+    expt_dict = make_expt_dict_uniform(EP, n_expts_tot)
+    return make_expt_assignment(EP, n_expts_tot, expt_dict, device)
+
+
+def initialize_matmul(
+    batch: int,
+    dim1: int,
+    dim2: int,
+    n_expts_act: int,
+    n_expts_tot: int,
+    dtype: torch.dtype,
+) -> None:
+    if not _is_distributed_launch():
+        return
+    world_size = dist.get_world_size()
+    device = torch.cuda.current_device()
+    symm_mem_pool.initialize_matmul(
+        n_tokens_global=batch,
+        d_input=dim1,
+        d_model=dim2,
+        n_expts_act=n_expts_act,
+        n_expts_tot=n_expts_tot,
+        n_ranks=world_size,
+        dtype=dtype,
+        group=dist.group.WORLD,
+        device=device,
+    )
 
 
 def setup() -> Tuple[int, int]:
@@ -82,282 +111,81 @@ def all_gather(x: torch.Tensor, dim=0) -> torch.Tensor:
 
 def reduce_scatter(
     input_tensor: torch.Tensor,
-    metadata: ReduceScatterMetadata = None,
+    n_expts_act: int,
+    metadata: ReduceScatterMetadata,
+    expt_assignment: Optional[ExptAssignment] = None,
     dim: int = 0,
     op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
 ) -> torch.Tensor:
     if _is_distributed_launch():
-
-        def dtype_cast(dtype: torch.dtype) -> torch.dtype:
-            # check if dtype is fp8, then convert it to float16 before reducing
-            if dtype in [torch.float16, torch.bfloat16, torch.float32]:
-                return dtype
-            else:
-                return torch.float16
-
-        world_size = dist.get_world_size()
-        original_dtype = input_tensor.dtype
-        intermediate_dtype = dtype_cast(original_dtype)
-        if metadata and metadata.input_split_sizes:
-            assert dim == 0, "metadata only works with dim=0"
-            input_list = list(input_tensor.split(metadata.input_split_sizes, dim=0))
-            output_list = all_to_all(input_list, dim=0)
-            n_tokens = metadata.ep_indx.size(dim)
-            other_dims = input_tensor.shape[1:]
-            output_tensor = input_tensor.new_zeros((n_tokens, ) + other_dims, dtype=intermediate_dtype)
-            for i in range(world_size):
-                ep_rank = i // metadata.TP
-                mask = torch.any(metadata.ep_indx == ep_rank, dim=1)
-                if op == dist.ReduceOp.SUM:
-                    output_tensor[mask] += output_list[i].to(intermediate_dtype)
-                else:
-                    raise NotImplementedError(f"Reduce operation {op} is not implemented.")
-            return output_tensor.to(original_dtype)
+        if metadata.mode and metadata.mode == "ep_sharding":
+            if dim != 0 or op != dist.ReduceOp.SUM:
+                raise NotImplementedError("Only dim=0 and op=SUM are supported for MoE reduce_scatter.")
+            output = convert_ep_to_dp(input_tensor, expt_assignment, metadata.active_indx, metadata.combine_indx)
+            # weighted average of the output token from experts
+            output = output.view(-1, n_expts_act, output.shape[-1])
+            output, _ = reduce(output, dim=1)
+            return output
         else:
-            input_list = list(input_tensor.chunk(world_size, dim=dim))
-            shape = input_list[0].shape
-            input_list = [x.to(intermediate_dtype) for x in input_list]
-            output_tensor = input_tensor.new_empty(shape, dtype=intermediate_dtype)
-            dist.reduce_scatter(output_tensor, input_list, op=op)
-            return output_tensor.to(original_dtype)
+            raise NotImplementedError(f"Distributed reduce_scatter mode {metadata.mode} is not implemented yet.")
     else:
         return input_tensor
 
 
-def all_to_all(input_list: list[torch.Tensor], dim: int = 0) -> list[torch.Tensor]:
-    if _is_distributed_launch():
-        # Check if all tensors have only one dimension with different sizes
-        for t in input_list:
-            for d in range(t.dim()):
-                if d != dim and t.size(d) != input_list[0].size(d):
-                    raise ValueError("All tensors must have the same size in all dimensions except the specified one.")
-        input_sizes = [t.size(dim) for t in input_list]
-        input_sizes = torch.tensor(input_sizes, device=input_list[0].device).unsqueeze(0)
-        input_sizes = all_gather(input_sizes, dim=0)
-        output_split_sizes = input_sizes[:, dist.get_rank()].tolist()
-        other_dims = list(input_list[0].shape[:dim] + input_list[0].shape[dim + 1:])
-        output_list = [
-            torch.empty([size] + other_dims, dtype=input_list[0].dtype, device=input_list[0].device)
-            for size in output_split_sizes
-        ]
-        dist.all_to_all(output_list, input_list)
-        return output_list
-    else:
-        return input_list
-
-
-def routing(x, logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=None, EP=1,
-            TP=1) -> Tuple[RoutingData, GatherIndx, ScatterIndx, ReduceScatterMetadata]:
-    if _is_distributed_launch():
-        assert expt_indx is None, "expt_indx should be None for distributed routing"
-        _, n_expts_tot = logits.shape
-
-        # Use the same topk as triton_kernels for consistent tie-breaking behavior
-        if sm_first:
-            logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, _ = topk(logits, n_expts_act, apply_softmax=sm_first, n_rows=n_rows)
-        expt_indx = expt_indx.int()
-
-        # Sort each token's selections by expert
-        expt_indx, sort_indices = torch.sort(expt_indx, dim=1, stable=True)
-        expt_scal = torch.gather(expt_scal, 1, sort_indices)
-
-        chunk_size = n_expts_tot // EP
-        output_split_sizes = None
-        ep_indx = None
-
-        if EP > 1:
-            # Distributed Expert Parallelism
-            ep_rank = dist.get_rank() // TP
-            ep_indx = expt_indx // chunk_size
-
-            # Partition tokens by expert parallelism rank
-            expt_scal_list = []
-            expt_indx_list = []
-            x_list = []
-
-            for i in range(EP):
-                mask = torch.any(ep_indx == i, dim=1)
-                expt_scal_masked = expt_scal[mask]
-                expt_indx_masked = expt_indx[mask]
-                x_masked = x[mask]
-
-                for _ in range(TP):
-                    expt_scal_list.append(expt_scal_masked)
-                    expt_indx_list.append(expt_indx_masked)
-                    x_list.append(x_masked)
-
-            # Exchange data across processes
-            expt_scal_list = all_to_all(expt_scal_list, dim=0)
-            expt_indx_list = all_to_all(expt_indx_list, dim=0)
-            x_list = all_to_all(x_list, dim=0)
-
-            output_split_sizes = [x.size(0) for x in expt_scal_list]
-            expt_scal = torch.cat(expt_scal_list, dim=0)
-            expt_indx = torch.cat(expt_indx_list, dim=0)
-            x = torch.cat(x_list, dim=0)
-
-            # Filter for local experts only
-            mask = (expt_indx // chunk_size) == ep_rank
-            expt_indx -= ep_rank * chunk_size
-            expt_scal = expt_scal.masked_fill(~mask, 0)
-            expt_indx = expt_indx.masked_fill(~mask, n_expts_tot)
+# TODO: support TP > 1
+# TODO: clean up duplicate code with triton_kernels.test_distributed.py
+# TODO: Support nonuniform expert assignment
+def routing(
+    x,
+    logits,
+    n_expts_act,
+    sm_first: bool = False,
+    y_indx: Optional[torch.Tensor] = None,
+    EP: int = 1,
+    TP: int = 1,
+    expt_assignment: Optional[ExptAssignment] = None,
+    mode: Optional[str] = None,
+) -> Tuple[torch.Tensor, RaggedTensorMetadata, torch.Tensor, torch.Tensor, Optional[ReduceScatterMetadata]]:
+    if _is_distributed_launch() and mode:
+        if mode == "ep_sharding":
+            if not expt_assignment:
+                raise ValueError("expt_assignment must be provided for distributed routing.")
+            if TP > 1:
+                raise NotImplementedError("TP > 1 is not supported in distributed MoE benchmark yet.")
+            rank = dist.get_rank()
+            expt_map = expt_assignment.expt_map[rank, :]
+            logits_global = topk(
+                logits,
+                n_expts_act,
+                apply_softmax=not sm_first,
+                y_indx=y_indx,
+                all_gather=True,
+            )
+            active_indx = logits_global.indx
+            expt_sizes = logits_global.mask_metadata.col_sum
+            dispatch_indx = logits_global.mask_metadata.row_sorted_indx
+            combine_indx = logits_global.mask_metadata.col_sorted_indx
+            logits_global_metadata = make_ragged_tensor_metadata(expt_sizes, dispatch_indx.shape[0])
+            x = convert_dp_to_ep(x, expt_assignment, active_indx, dispatch_indx)
+            logits_local_metadata = remap_ragged_tensor_metadata(logits_global_metadata, expt_map)
+            reduce_scatter_metadata = ReduceScatterMetadata(
+                mode=mode,
+                active_indx=active_indx,
+                dispatch_indx=dispatch_indx,
+                combine_indx=combine_indx,
+            )
+            return x, logits_local_metadata, None, None, reduce_scatter_metadata
         else:
-            # Distributed Data Parallelism
-            x = all_gather(x, dim=0)
-            expt_scal = all_gather(expt_scal, dim=0)
-            expt_indx = all_gather(expt_indx, dim=0)
-
-        # Flatten topk data
-        expt_scal = expt_scal.reshape(-1)
-        expt_indx = expt_indx.reshape(-1).to(torch.int32)
-
-        # Sort by expert_id for contiguous experts in matmul
-        expt_indx, topk_indx = torch.sort(expt_indx, stable=True)
-        gate_indx = torch.argsort(topk_indx, stable=True)
-
-        mask = expt_indx != n_expts_tot
-        topk_indx[~mask] = -1
-        gate_indx[gate_indx >= mask.sum()] = -1
-        gate_scal = expt_scal[topk_indx]
-        hist = torch.histc(expt_indx[mask], bins=chunk_size, min=0, max=chunk_size - 1)
-
-        # Pack the matmul data structures
-        gather_indx = GatherIndx(src_indx=topk_indx.int(), dst_indx=gate_indx.int())
-        scatter_indx = ScatterIndx(src_indx=gate_indx.int(), dst_indx=topk_indx.int())
-        n_gates = mask.sum().item()
-        expt_data = compute_expt_data(hist, chunk_size, n_gates)
-
-        return (
-            x,
-            RoutingData(gate_scal, hist, chunk_size, n_expts_act, expt_data=expt_data),
-            gather_indx,
-            scatter_indx,
-            ReduceScatterMetadata(input_split_sizes=output_split_sizes, ep_indx=ep_indx, EP=EP, TP=TP),
-        )
+            raise NotImplementedError(f"Distributed routing mode {mode} is not implemented yet.")
     else:
-        return x, *triton_kernels.routing.routing(logits, n_expts_act, sm_first, expt_indx, EP, n_rows), None
-
-
-# The following dummy methods simulate the behavior of distributed operations
-# in a non-distributed environment for testing purposes.
-# Assuming each rank has the same data for simplicity.
-
-
-def dummy_all_gather(out, x):
-    out[0].copy_(x)
-    out[1].copy_(x)
-
-
-def dummy_all_to_all(output_list, input_list):
-    output_list[0].copy_(input_list[0])
-    output_list[1].copy_(input_list[0])
-
-
-def dummy_reduce_scatter(out, x_list, op):
-    out.copy_(x_list[0] * 2)
-
-
-def test_all_gather_non_distributed(monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    x = torch.randn(4, 5)
-    result = all_gather(x, dim=0)
-    torch.testing.assert_close(result, x)
-
-
-@pytest.mark.parametrize("dim", [0, 1])
-def test_all_gather_distributed(monkeypatch, dim):
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "all_gather", dummy_all_gather)
-
-    x = torch.randn(4, 4)
-    result = all_gather(x, dim=dim)
-    expected = torch.cat([x, x], dim=dim)
-    torch.testing.assert_close(result, expected)
-
-
-def test_reduce_scatter_non_distributed(monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    x = torch.randn(4, 6)
-    result = reduce_scatter(x, dim=0)
-    torch.testing.assert_close(result, x)
-
-
-def test_reduce_scatter_distributed(monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "reduce_scatter", dummy_reduce_scatter)
-
-    x = torch.randn(4, 6)
-    expected = x.chunk(2, dim=0)[0] * 2
-
-    result = reduce_scatter(x, dim=0)
-    torch.testing.assert_close(result, expected)
-
-
-def test_reduce_scatter_distributed_with_metadata(monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(dist, "all_to_all", dummy_all_to_all)
-    monkeypatch.setattr(dist, "all_gather", dummy_all_gather)
-
-    input_split_sizes = [1, 1]
-    ep_indx = torch.tensor([[0], [1]])
-    metadata = ReduceScatterMetadata(input_split_sizes=input_split_sizes, ep_indx=ep_indx, EP=2)
-    # Assume the current ep rank is 0.
-    # [1, 2] comes from rank 0
-    # [3, 4] comes from rank 1.
-    x = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
-
-    result = reduce_scatter(x, metadata=metadata, dim=0)
-    torch.testing.assert_close(result, torch.tensor([[1, 2], [1, 2]], dtype=torch.float32))
-
-
-def test_routing_distributed_EP(monkeypatch):
-    # Test distributed routing with EP=1 (token_mask should be None)
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    # Set environment for local rank and distributed group
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(dist, "all_gather", dummy_all_gather)
-    monkeypatch.setattr(dist, "all_to_all", dummy_all_to_all)
-
-    # NOTE: must set `device="cuda"` since `routing` expects CUDA tensors.
-    logits = torch.tensor([[0.1, 0.2, 0.4, 0.3], [0.5, 0.4, 0.3, 0.1]], device="cuda", dtype=torch.float16)
-    x = torch.randn_like(logits, device="cuda", dtype=torch.float16)
-    n_expts_act = 2
-    EP = 2
-    expt_indx = torch.tensor([[0, 1], [0, 1]], device="cuda").reshape(-1)
-    topk_indx = torch.argsort(expt_indx, stable=True)
-    gate_indx = torch.argsort(topk_indx, stable=True)
-    _, rdata, gather_indx, scatter_indx, metadata = routing(x, logits, n_expts_act, EP=EP)
-    assert torch.equal(gather_indx.src_indx, topk_indx.int())
-    assert torch.equal(gather_indx.dst_indx, gate_indx.int())
-    assert torch.equal(scatter_indx.src_indx, gate_indx.int())
-    assert torch.equal(scatter_indx.dst_indx, topk_indx.int())
-
-
-def test_all_to_all(monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(dist, "all_to_all", dummy_all_to_all)
-    monkeypatch.setattr(dist, "all_gather", dummy_all_gather)
-
-    input_list = [torch.tensor([1, 2], dtype=torch.float32), torch.tensor([3, 4], dtype=torch.float32)]
-    output_list = all_to_all(input_list)
-    assert torch.equal(output_list[0], torch.tensor([1, 2], dtype=torch.float32))
-    assert torch.equal(output_list[1], torch.tensor([1, 2], dtype=torch.float32))
-    assert len(output_list) == 2
+        # If mode is not specified or we have a single process, we do single-GPU routing.
+        logits = topk(logits, n_expts_act, y_indx=y_indx, apply_softmax=not sm_first)
+        dispatch_indx = logits.mask_metadata.row_sorted_indx
+        combine_indx = logits.mask_metadata.col_sorted_indx
+        ragged_metadata = make_ragged_tensor_metadata(logits.mask_metadata.col_sum, dispatch_indx.shape[0])
+        gather_indx = combine_indx // n_expts_act
+        scatter_indx = combine_indx
+        return x, ragged_metadata, gather_indx, scatter_indx, None
 
 
 def gather_ep(rank, world_size, param, TP, EP):
@@ -441,13 +269,14 @@ def distributed_run(rank, world_size, batch, dim1, dim2, n_expts_tot, n_expts_ac
         w1_full = w2_full = w1_flex_full = w2_flex_full = w1_scale_full = w2_scale_full = None
 
     # precision configs
-    pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=wg_flex), weight_scale=wg_scale)
-    act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")), (1.0, 1.0), 2)
-    pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), weight_scale=w1_scale)
-    pc2 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex), weight_scale=w2_scale)
+    pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=wg_flex), b_mx_scale=wg_scale)
+    act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"), reduction_n=2),
+                          (1.0, 1.0))
+    pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), b_mx_scale=w1_scale)
+    pc2 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex), b_mx_scale=w2_scale)
     if rank == 0:
-        pc1_full = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex_full), weight_scale=w1_scale_full)
-        pc2_full = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex_full), weight_scale=w2_scale_full)
+        pc1_full = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex_full), b_mx_scale=w1_scale_full)
+        pc2_full = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex_full), b_mx_scale=w2_scale_full)
     else:
         pc1_full = pc2_full = None
 
@@ -459,30 +288,43 @@ def distributed_run(rank, world_size, batch, dim1, dim2, n_expts_tot, n_expts_ac
     }
     xd = torch.randn((batch // world_size, dim1), device=dev).to(dtype_map[x_dtype])
     x0 = all_gather(xd, dim=0)
+    expt_assignment = create_expt_assignment(EP, n_expts_tot, torch.device(dev))
+    symm_mem_pool.initialize_matmul(
+        n_tokens_global=batch,
+        d_input=dim1,
+        d_model=dim2,
+        n_expts_act=n_expts_act,
+        n_expts_tot=n_expts_tot,
+        n_ranks=world_size,
+        dtype=x0.dtype,
+        group=dist.group.WORLD,
+        device=torch.cuda.current_device(),
+    )
 
     # single-GPU pass
     def single(x):
         xg = x.to(wg.dtype if n_expts_tot > 1 else x.dtype)
         if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gi, si = triton_kernels.routing.routing(logits, n_expts_act)
+            logits = matmul(xg, wg, bg, precision_config=pcg)
+            x, rdata, gi, si, _ = routing(x, logits, n_expts_act)
         else:
             rdata = gi = si = None
-        x = matmul_ogs(x, w1_full, b1_full, rdata, gather_indx=gi, precision_config=pc1_full, fused_activation=act)
-        return matmul_ogs(x, w2_full, b2_full, rdata, scatter_indx=si, precision_config=pc2_full)
+        x = matmul(x, w1_full, b1_full, rdata, gather_indx=gi, precision_config=pc1_full, fused_activation=act)
+        return matmul(x, w2_full, b2_full, rdata, scatter_indx=si, precision_config=pc2_full)
 
     # distributed pass
     def distributed(x):
         xg = x.to(wg.dtype if n_expts_tot > 1 else x.dtype)
         if n_expts_tot > 1:  # sparse
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            x, rdata, gi, si, metadata = routing(x, logits, n_expts_act, EP=EP, TP=TP)
+            logits = matmul(xg, wg, bg, precision_config=pcg)
+            x, rdata, gi, si, metadata = routing(x, logits, n_expts_act, EP=EP, TP=TP, expt_assignment=expt_assignment,
+                                                 mode="ep_sharding")
         else:  # dense
             x = all_gather(x, dim=0)
             rdata = gi = si = metadata = None
-        x = matmul_ogs(x, w1, b1, rdata, gather_indx=gi, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=si, precision_config=pc2)
-        x = reduce_scatter(x, metadata=metadata, dim=0)
+        x = matmul(x, w1, b1, rdata, gather_indx=gi, precision_config=pc1, fused_activation=act)
+        x = matmul(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=si, precision_config=pc2)
+        x = reduce_scatter(x, n_expts_act, metadata=metadata, expt_assignment=expt_assignment)
         # gather the result from all GPUs, just for verification
         return all_gather(x, dim=0)
 
@@ -501,43 +343,32 @@ has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_versio
 
 @pytest.mark.parametrize(
     "batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP",
-    [
-        # dense cases - test parallelism
-        (1024, 1024, 1024, 1, 1, "bf16", "bf16", 1, 1),
-        (1024, 1024, 1024, 1, 1, "bf16", "bf16", 4, 1),
-    ] +
-    # dense cases - test precision
-    [(1024, 1024, 1024, 1, 1, "fp8", "fp8", 1, 1), (1024, 1024, 1024, 1, 1, "fp8", "fp8", 4, 1)]
+    # dense cases
+    [(1024, 1024, 1024, 1, 1, "bf16", "bf16", 1, 1), (1024, 1024, 1024, 1, 1, "fp8", "fp8", 1, 1)]
     # moe cases - test parallelism
     + [
         (1024, 1024, 1024, 128, 2, "bf16", "bf16", 1, 1),
-        (1024, 1024, 1024, 128, 2, "bf16", "bf16", 4, 1),
         (1024, 1024, 1024, 128, 2, "bf16", "bf16", 1, 4),
-        (1024, 1024, 1024, 128, 2, "bf16", "bf16", 2, 2),
     ] +
     # moe cases - test precision
     ([
         (1024, 1024, 1024, 128, 2, "fp8", "mx4", 1, 1),
-        (1024, 1024, 1024, 128, 2, "fp8", "mx4", 4, 1),
         (1024, 1024, 1024, 128, 2, "fp8", "mx4", 1, 4),
-        (1024, 1024, 1024, 128, 2, "fp8", "mx4", 2, 2),
     ] if has_native_mx4 else [
         (1024, 1024, 1024, 128, 2, "bf16", "mx4", 1, 1),
-        (1024, 1024, 1024, 128, 2, "bf16", "mx4", 4, 1),
         (1024, 1024, 1024, 128, 2, "bf16", "mx4", 1, 4),
-        (1024, 1024, 1024, 128, 2, "bf16", "mx4", 2, 2),
     ]),
 )
 def test_mlp_mp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, monkeypatch):
     parallelism = TP * EP
+    if is_hip():
+        pytest.skip("[TODO] HIP support for distributed MoE.")
     if torch.cuda.device_count() < parallelism:
         pytest.skip(f"Test requires at least {parallelism} GPUs.")
-    if not cuda_capability_geq(9, 0):
+    if is_cuda() and not cuda_capability_geq(9, 0):
         pytest.skip("Test requires CUDA compute capability >= 9.0.")
-    if get_cdna_version() == 4 and EP > 1:
-        pytest.skip("[TODO] Unknown issue with CDNA 4 and EP > 1")
-    if TP > 1 and x_dtype == "fp8":
-        pytest.skip("[TODO] Testing FP8 is not supported for TP > 1.")
+    if TP > 1:
+        pytest.skip("[TODO] TP > 1 is not supported yet in distributed mode.")
 
     monkeypatch.setenv("WORLD_SIZE", f"{parallelism}")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")

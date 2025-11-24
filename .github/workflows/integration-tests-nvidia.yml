@@ -27,7 +27,7 @@ jobs:
       CCACHE_COMPRESS: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: "true"
       - name: Compute cache keys
@@ -96,10 +96,12 @@ jobs:
         run: make test-interpret
       - name: Run regression tests
         run: make test-regression
+      - name: Run microbenchmark tests
+        # Microbenchmark never fail but running them gives us an easy way to track performance changes.
+        run: make test-microbenchmark
       - name: Run C++ unittests
         run: make test-cpp
       - name: Run Proton tests
-        if: ${{ matrix.runner[0] != 'nvidia-gb200' }}
         run: make test-proton
       - name: Inspect cache directories
         run: |

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from ..runtime.jit import jit
+from ..runtime.jit import jit, constexpr_function
 from . import core
 from . import math
 
 # constexpr utilities
 
 
-@core.constexpr_function
+@constexpr_function
 def _log2(i):
     log2 = 0
     n = i
@@ -17,10 +17,12 @@ def _log2(i):
     return log2
 
 
-@core.constexpr_function
+@constexpr_function
 def _is_power_of_two(i):
     return (i & (i - 1)) == 0 and i != 0
 
+
+_get_int_dtype = constexpr_function(core.get_int_dtype)
 
 # -----------------------
 # Standard library
@@ -38,7 +40,7 @@ def cdiv(x, div):
     :param div: the divisor
     :type div: Block
     """
-    return (x + div - 1) // div
+    return (x + (div - 1)) // div
 
 
 @core._tensor_member_fn
@@ -264,7 +266,7 @@ def _sum_combine(a, b):
 # sum
 
 
-@core.constexpr_function
+@constexpr_function
 def _pick_sum_dtype(in_dtype, dtype):
     if dtype is not None:
         return dtype
@@ -374,7 +376,7 @@ def _compare_and_swap(x, flip, i: core.constexpr):
     n_dims: core.constexpr = _log2(x.numel)
 
     # flip along middle dimension (the bitwise XORs will be optimised away):
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    idtype = _get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
     ix = x.to(idtype, bitcast=True)
     iy = ix ^ xor_sum(ix, n_dims - 1 - i, True)
     y = iy.to(x.dtype, bitcast=True)
@@ -441,7 +443,7 @@ def sort_impl(x, k: core.constexpr = None, dim: core.constexpr = None, descendin
     n_dims: core.constexpr = _log2(x.numel)
 
     # reshape to hypercube:
-    h = core.reshape(x, [2] * n_dims)
+    h = core.reshape(x, [2] * n_dims if n_dims else [1])
 
     # run first log_k bitonic sort iterations:
     for i in core.static_range(1, log_k + 1):
@@ -477,7 +479,7 @@ def bitonic_merge(x, dim: core.constexpr = None, descending: core.constexpr = co
     return _bitonic_merge(x, n_dims, descending, n_dims)
 
 
-@core.constexpr_function
+@constexpr_function
 def _get_flip_dim(dim, shape):
     if dim is None:
         dim = len(shape) - 1
@@ -503,7 +505,7 @@ def flip(x, dim=None):
     steps: core.constexpr = _log2(x.shape[_dim])
 
     # reshape the swap dimension to (2, 2, ..., 2)
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    idtype = _get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
     y = core.reshape(x.to(idtype, bitcast=True), x.shape[:_dim] + [2] * steps + x.shape[_dim + 1:])
     for i in core.static_range(steps):
         y = y ^ xor_sum(y, _dim + i, True)

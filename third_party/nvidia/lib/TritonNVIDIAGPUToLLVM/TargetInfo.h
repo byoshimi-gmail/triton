@@ -17,6 +17,9 @@ public:
   Value ballot(RewriterBase &rewriter, Location loc, Type type,
                Value cmp) const override;
 
+  void barrier(Location loc, RewriterBase &rewriter,
+               bool isWarpSync = false) const override;
+
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     std::optional<Value> ctaId, Value val,
                     Value pred) const override;
@@ -26,6 +29,7 @@ public:
 
   bool supportLdMatrix() const override { return computeCapability >= 75; }
   bool supportStMatrix() const override { return computeCapability >= 90; }
+  bool supportLdStMatrixB8() const override { return computeCapability >= 100; }
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
@@ -35,6 +39,9 @@ public:
                    int i) const override;
   Value shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                    Value i) const override;
+
+  Value permute(RewriterBase &rewriter, Location loc, Value a, Value b,
+                Value selector) const override;
 
   Value programId(RewriterBase &rewriter, Location loc, ModuleOp moduleOp,
                   ProgramIDDim axis) const override;

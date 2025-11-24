@@ -54,6 +54,10 @@ def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
+def is_sm12x():
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 12
+
+
 def is_hip():
     target = get_current_target()
     return False if target is None else target.backend == "hip"
@@ -74,9 +78,19 @@ def is_hip_cdna4():
     return target is not None and target.backend == 'hip' and target.arch == 'gfx950'
 
 
+def is_hip_gfx11():
+    target = get_current_target()
+    return target is not None and target.backend == 'hip' and 'gfx11' in target.arch
+
+
 def is_hip_gfx12():
     target = get_current_target()
     return target is not None and target.backend == 'hip' and 'gfx12' in target.arch
+
+
+def is_hip_gfx1250():
+    target = get_current_target()
+    return target is not None and target.backend == 'hip' and 'gfx1250' in target.arch
 
 
 def is_hip_cdna():
@@ -184,6 +198,14 @@ def supports_tma(byval_only=False):
     return torch.cuda.get_device_capability()[0] >= 9 and cuda_version_tuple >= min_cuda_version
 
 
+def supports_ws():
+    if is_interpreter():
+        return True
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 9
+
+
 def tma_skip_msg(byval_only=False):
     if byval_only:
         return "Requires __grid_constant__ TMA support (NVIDIA Hopper or higher, CUDA 12.0 or higher)"
@@ -204,11 +226,13 @@ def unwrap_tensor(t: Union[torch.Tensor, triton.runtime.jit.TensorWrapper]) -> t
     return t
 
 
-def _fresh_knobs_impl(monkeypatch, skipped_attr: Optional[Set[str]] = None):
+def _fresh_knobs_impl(skipped_attr: Optional[Set[str]] = None):
     from triton import knobs
 
     if skipped_attr is None:
         skipped_attr = set()
+
+    monkeypatch = pytest.MonkeyPatch()
 
     knobs_map = {
         name: knobset
@@ -237,6 +261,9 @@ def _fresh_knobs_impl(monkeypatch, skipped_attr: Optional[Set[str]] = None):
     def reset_function():
         for name, knobset in knobs_map.items():
             setattr(knobs, name, knobset)
+        # `undo` should be placed before `del os.environ`
+        # Otherwise, it may restore environment variables that monkeypatch deleted
+        monkeypatch.undo()
         for k in env_to_unset:
             if k in os.environ:
                 del os.environ[k]
